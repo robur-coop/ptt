@@ -1,0 +1,341 @@
+open Colombe
+open Rresult
+
+module Value = struct
+  type helo = Domain.t
+  type mail_from = Reverse_path.t * (string * string option) list
+  type rcpt_to = Forward_path.t * (string * string option) list
+  type auth = PLAIN
+  type pp_220 = string list
+  type pp_221 = string list
+  type pp_235 = string list
+  type pp_250 = string list
+  type tp_334 = string list
+  type tp_354 = string list
+  type tn_454 = string list
+  type pn_503 = string list
+  type pn_504 = string list
+  type pn_530 = string list
+  type pn_535 = string list
+  type pn_554 = string list
+  type pn_555 = string list
+  type code = int * string list
+
+  type 'x recv =
+    | Helo : helo recv
+    | Mail_from : mail_from recv
+    | Rcpt_to : rcpt_to recv
+    | Data : unit recv
+    | Dot : unit recv
+    | Quit : unit recv
+    | Auth : auth recv
+    | Payload : string recv
+    | Any : Request.t recv
+
+  type 'x send =
+    | PP_220 : pp_220 send
+    | PP_221 : pp_221 send
+    | PP_250 : pp_250 send
+    | PP_235 : pp_235 send
+    | TP_334 : tp_334 send
+    | TP_354 : tp_354 send
+    | TN_454 : tn_454 send
+    | PN_503 : pn_503 send
+    | PN_504 : pn_504 send
+    | PN_530 : pn_530 send
+    | PN_535 : pn_535 send
+    | PN_554 : pn_554 send
+    | PN_555 : pn_555 send
+    | Payload : string send
+    | Code : code send
+
+  type error =
+    [ Request.Decoder.error
+    | Reply.Encoder.error
+    | `Too_many_bad_commands
+    | `No_recipients
+    | `Too_many_recipients ]
+
+  let pp_error ppf = function
+    | #Reply.Encoder.error as err -> Reply.Encoder.pp_error ppf err
+    | #Request.Decoder.error as err -> Request.Decoder.pp_error ppf err
+    | `Too_many_bad_commands -> Fmt.string ppf "Too many bad commands"
+    | `No_recipients -> Fmt.string ppf "No recipients"
+    | `Too_many_recipients -> Fmt.string ppf "Too many recipients"
+end
+
+module type MONAD = sig
+  type context
+  type error
+
+  val bind :
+       ('a, 'err) Colombe.State.t
+    -> f:('a -> ('b, 'err) Colombe.State.t)
+    -> ('b, 'err) Colombe.State.t
+
+  val ( let* ) :
+       ('a, 'err) Colombe.State.t
+    -> ('a -> ('b, 'err) Colombe.State.t)
+    -> ('b, 'err) Colombe.State.t
+
+  val ( let+ ) :
+       ('a, 'err) Colombe.State.t
+    -> (('a, 'err) result -> ('b, 'err) Colombe.State.t)
+    -> ('b, 'err) Colombe.State.t
+
+  val ( >>= ) :
+       ('a, 'err) Colombe.State.t
+    -> ('a -> ('b, 'err) Colombe.State.t)
+    -> ('b, 'err) Colombe.State.t
+
+  val encode :
+       context
+    -> 'a Value.send
+    -> 'a
+    -> (context -> ('b, ([> `Protocol of error ] as 'err)) Colombe.State.t)
+    -> ('b, 'err) Colombe.State.t
+
+  val decode :
+       context
+    -> 'a Value.recv
+    -> (   context
+        -> 'a
+        -> ('b, ([> `Protocol of error ] as 'err)) Colombe.State.t)
+    -> ('b, 'err) Colombe.State.t
+
+  val send :
+       context
+    -> 'a Value.send
+    -> 'a
+    -> (unit, [> `Protocol of error ]) Colombe.State.t
+
+  val recv :
+    context -> 'a Value.recv -> ('a, [> `Protocol of error ]) Colombe.State.t
+
+  val return : 'a -> ('a, 'err) Colombe.State.t
+  val fail : 'err -> ('a, 'err) Colombe.State.t
+
+  val reword_error :
+       ('err0 -> 'err1)
+    -> ('v, 'err0) Colombe.State.t
+    -> ('v, 'err1) Colombe.State.t
+
+  val error_msgf :
+    ('a, Format.formatter, unit, ('b, [> R.msg ]) Colombe.State.t) format4 -> 'a
+end
+
+let () = Colombe.Request.Decoder.add_extension "STARTTLS"
+let () = Colombe.Request.Decoder.add_extension "AUTH"
+
+type info = {
+    domain: Colombe.Domain.t
+  ; ipaddr: Ipaddr.t
+  ; tls: Tls.Config.server option
+  ; zone: Mrmime.Date.Zone.t
+  ; size: int
+}
+
+type email = {
+    from: Reverse_path.t * (string * string option) list
+  ; recipients: (Forward_path.t * (string * string option) list) list
+  ; domain_from: Domain.t
+}
+
+let src = Logs.Src.create "ptt.logic"
+
+module Log = (val Logs.src_log src : Logs.LOG)
+
+module Make (Monad : MONAD) = struct
+  let politely ~domain ~ipaddr =
+    Fmt.str "%a at your service, [%s]" Domain.pp domain
+      (Ipaddr.to_string ipaddr)
+
+  let m_properly_close_and_fail ctx ?(code = 554) message =
+    let open Monad in
+    send ctx Value.Code (code, [ message ])
+
+  let m_politely_close ctx =
+    let open Monad in
+    let* () = send ctx Value.PP_221 [ "Bye, buddy!" ] in
+    (* TODO(dinosaure): properly close when we use a STARTTLS context.
+       Currently fixed into [SMTP]: when we want to [`Quit], we properly
+       close the TLS connection. *)
+    return `Quit
+
+  let m_relay ctx ~domain_from =
+    let open Monad in
+    let reset = ref 0 and bad = ref 0 in
+    let rec mail_from () =
+      if !reset >= 25 || !bad >= 25 then
+        let msg = "You reached the limit buddy!" in
+        let* () = m_properly_close_and_fail ctx msg in
+        return `Quit
+      else
+        let+ command = recv ctx Value.Any in
+        match command with
+        | Ok `Quit -> m_politely_close ctx
+        | Ok (`Mail from) ->
+            let* () = send ctx Value.PP_250 [ "Ok, buddy!" ] in
+            recipients ~from []
+        | Error err ->
+            fail err (* TODO(dinosaure): catch [`Invalid_reverse_path _]. *)
+        | Ok `Reset ->
+            incr reset;
+            send ctx Value.PP_250 [ "Yes buddy!" ] >>= fun () -> mail_from ()
+        | Ok v ->
+            incr bad;
+            Log.warn (fun m ->
+                m "%a sended a bad command: %a" Domain.pp domain_from Request.pp
+                  v);
+            send ctx Value.PN_503 [ "Command out of sequence" ] >>= fun () ->
+            mail_from ()
+    and recipients ~from acc =
+      if !reset >= 25 || !bad >= 25 then
+        let msg = "You reached the limit buddy!" in
+        let* () = m_properly_close_and_fail ctx msg in
+        return `Quit
+      else
+        let* command = recv ctx Value.Any in
+        match command with
+        | `Data -> begin
+            match acc with
+            | [] ->
+                let* () = m_properly_close_and_fail ctx "No recipients" in
+                return `Quit
+            | acc ->
+                let recipients = List.rev acc in
+                return (`Send { from; recipients; domain_from })
+          end
+        | `Recipient v ->
+            (* XXX(dinosaure): the minimum number of recipients that MUST be
+             buffered is 100 recipients. *)
+            if List.length acc < 100 then
+              send ctx Value.PP_250 [ "Ok, buddy!" ] >>= fun () ->
+              recipients ~from (v :: acc)
+            else
+              send ctx Value.Code (452, [ "Too many recipients, buddy! " ])
+              >>= fun () -> fail `Too_many_recipients
+        | `Reset ->
+            incr reset;
+            send ctx Value.PP_250 [ "Yes buddy!" ] >>= fun () -> mail_from ()
+        | `Quit -> m_politely_close ctx
+        | v ->
+            incr bad;
+            Log.warn (fun m ->
+                m "%a sended a bad command: %a" Domain.pp domain_from Request.pp
+                  v);
+            send ctx Value.PN_503 [ "Command out of sequence" ] >>= fun () ->
+            recipients ~from acc
+    in
+    mail_from ()
+
+  exception Unrecognized_authentication
+
+  let m_submission ctx ~domain_from ms =
+    let open Monad in
+    let reset = ref 0 and bad = ref 0 in
+    let rec auth_0 () =
+      if !reset >= 25 || !bad >= 25 then
+        let msg = "You reached the limit buddy!" in
+        let* () = m_properly_close_and_fail ctx msg in
+        return `Quit
+      else
+        let* command = recv ctx Value.Any in
+        match command with
+        | `Verb ("AUTH", [ mechanism ]) -> (
+            try
+              let mechanism = Mechanism.of_string_exn mechanism in
+              if List.exists (Mechanism.equal mechanism) ms then
+                return (`Authentication (domain_from, mechanism))
+              else raise Unrecognized_authentication
+            with Invalid_argument _ | Unrecognized_authentication ->
+              incr bad;
+              send ctx Value.PN_504 [ "Unrecognized authentication!" ]
+              >>= auth_0)
+        | `Verb ("AUTH", [ mechanism; payload ]) -> (
+            try
+              let mechanism = Mechanism.of_string_exn mechanism in
+              if List.exists (Mechanism.equal mechanism) ms then
+                return
+                  (`Authentication_with_payload (domain_from, mechanism, payload))
+              else raise Unrecognized_authentication
+            with Invalid_argument _ | Unrecognized_authentication ->
+              incr bad;
+              send ctx Value.PN_504 [ "Unrecognized authentication!" ]
+              >>= auth_0)
+        | `Verb ("AUTH", []) ->
+            incr bad;
+            let* () = send ctx Value.PN_555 [ "Syntax error, buddy!" ] in
+            auth_0 ()
+        | `Reset ->
+            incr reset;
+            send ctx Value.PP_250 [ "Yes buddy!" ] >>= auth_0
+        | `Quit -> m_politely_close ctx
+        | v ->
+            incr bad;
+            Log.warn (fun m ->
+                m " %a sended a bad command: %a" Domain.pp domain_from
+                  Request.pp v);
+            let* () =
+              send ctx Value.PN_530 [ "Authentication required, buddy!" ]
+            in
+            auth_0 ()
+    in
+    auth_0 ()
+
+  let m_mail ctx =
+    let open Monad in
+    send ctx Value.TP_354 [ "Ok buddy! Finish it with <crlf>.<crlf>" ]
+
+  let m_end result ctx =
+    let open Monad in
+    let* () =
+      match result with
+      | `Ok -> send ctx Value.PP_250 [ "Mail sended, buddy!" ]
+      | `Aborted ->
+          let msg = [ "Requested action aborted: local error in processing" ] in
+          send ctx Value.Code (451, msg)
+      | `Not_enough_memory ->
+          let msg =
+            [ "Requested action not taken: insufficient system storage" ]
+          in
+          send ctx Value.Code (452, msg)
+      | `Too_big_data ->
+          let msg =
+            [ "Requested mail action aborted: exceeded storage allocation" ]
+          in
+          send ctx Value.Code (552, msg)
+      | `Failed -> send ctx Value.Code (554, [ "Transaction failed" ])
+      | `Requested_action_not_taken `Temporary ->
+          send ctx Value.Code (450, [ "Requested mail action not taken" ])
+      | `Requested_action_not_taken `Permanent ->
+          send ctx Value.Code (550, [ "Requested mail action not taken" ])
+    in
+    let* () = recv ctx Value.Quit in
+    m_politely_close ctx
+
+  let m_relay_init ctx info =
+    let open Monad in
+    let* domain_from = recv ctx Value.Helo in
+    let* () =
+      send ctx Value.PP_250
+        [
+          politely ~domain:info.domain ~ipaddr:info.ipaddr; "8BITMIME"
+        ; "SMTPUTF8"; Fmt.str "SIZE %d" info.size
+        ]
+    in
+    m_relay ctx ~domain_from
+
+  let m_submission_init ctx info ms =
+    let open Monad in
+    let* domain_from = recv ctx Value.Helo in
+    let* () =
+      send ctx Value.PP_250
+        [
+          politely ~domain:info.domain ~ipaddr:info.ipaddr; "8BITMIME"
+        ; "SMTPUTF8"; Fmt.str "SIZE %d" info.size
+        ; Fmt.str "AUTH %a" Fmt.(list ~sep:(const string " ") Mechanism.pp) ms
+        ]
+    in
+    m_submission ctx ~domain_from ms
+end

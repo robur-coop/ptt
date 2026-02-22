@@ -1,0 +1,11 @@
+(library
+ (name ptt)
+ (public_name ptt)
+ (modules ptt logic smtp ssmtp mechanism)
+ (libraries dns msendmail mrmime colombe))
+
+(library
+ (name ptt_cli)
+ (public_name ptt.cli)
+ (modules ptt_cli)
+ (libraries mnet-cli ptt cmdliner))

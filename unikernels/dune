@@ -1,0 +1,59 @@
+(library
+ (name CA)
+ (public_name ptt.ca)
+ (modules CA)
+ (libraries x509 mirage-ptime.solo5))
+
+(library
+ (name analyze)
+ (public_name ptt.analyze)
+ (modules analyze)
+ (libraries flux arc dmarc mnet-dns))
+
+(executable
+ (name elit)
+ (modules elit)
+ (link_flags :standard -cclib "-z solo5-abi=hvt")
+ (libraries cattery ptt.analyze ptt.ca ptt.cli ptt mirage-crypto-rng-mkernel gmp re mkernel mnet mnet-cli mnet-dns cmdliner logs.fmt logs.cli fmt.cli)
+ (foreign_stubs
+  (language c)
+  (names manifest.elit)))
+
+(executable
+ (name signer)
+ (modules signer)
+ (link_flags :standard -cclib "-z solo5-abi=hvt")
+ (libraries cattery ptt.analyze ptt.ca ptt.cli ptt mirage-crypto-rng-mkernel gmp re mkernel mnet mnet-cli mnet-dns cmdliner logs.fmt logs.cli fmt.cli)
+ (foreign_stubs
+  (language c)
+  (names manifest.signer)))
+
+(rule
+ (targets manifest.elit.c)
+ (enabled_if
+  (= %{context_name} "default"))
+ (action
+  (write-file manifest.elit.c "")))
+
+(rule
+ (targets manifest.signer.c)
+ (enabled_if
+  (= %{context_name} "default"))
+ (action
+  (write-file manifest.signer.c "")))
+
+(rule
+ (targets manifest.elit.c)
+ (deps manifest.elit.json)
+ (enabled_if
+  (= %{context_name} "solo5"))
+ (action
+  (run solo5-elftool gen-manifest manifest.elit.json manifest.elit.c)))
+
+(rule
+ (targets manifest.signer.c)
+ (deps manifest.signer.json)
+ (enabled_if
+  (= %{context_name} "solo5"))
+ (action
+  (run solo5-elftool gen-manifest manifest.signer.json manifest.signer.c)))
