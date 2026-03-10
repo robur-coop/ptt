@@ -1,3 +1,6 @@
+module SMTP = Smtp
+module SSMTP = Ssmtp
+module Mechanism = Mechanism
 open Colombe
 
 type info = {
@@ -63,18 +66,35 @@ end
 
 module Submission : sig
   type ic = (string * email) Miou.Computation.t
-  type error
-  type authenticator = ?payload:string -> Mechanism.t -> string * bool
-  type authentication = Mechanism.t list * authenticator
+
+  type error =
+    [ `Aborted
+    | `Not_enough_memory
+    | `Too_big_data
+    | `Failed
+    | `Requested_action_not_taken of [ `Temporary | `Permanent ]
+    | `Invalid_recipients
+    | `No_recipients
+    | `Too_many_bad_commands
+    | `Too_many_recipients
+    | `Too_many_tries
+    | `Protocol of SSMTP.Value.error ]
+
+  type 'err authenticator =
+    [ `PLAIN of string option ] -> string -> (string * bool, 'err) result
+
+  type 'err authentication = Mechanism.t list * 'err authenticator
+
+  val pp_error : error Fmt.t
 
   val handler :
        ?encoder:(unit -> bytes)
     -> ?decoder:(unit -> bytes)
     -> info:info
     -> resolver
-    -> authentication
+    -> 'err authentication
     -> Mnet_tls.t
     -> ic * oc
     -> (string, 'r) Flux.Bqueue.t
-    -> (unit, error) result
+    -> (unit, ([> error ] as 'err)) result
 end

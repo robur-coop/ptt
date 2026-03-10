@@ -5,28 +5,69 @@
  (libraries x509 mirage-ptime.solo5))
 
 (library
- (name analyze)
- (public_name ptt.analyze)
- (modules analyze)
+ (name Dks)
+ (public_name ptt.dks)
+ (modules Dks)
+ (libraries dkim mnet mnet-dns dns dns-tsig x509 mirage-ptime.solo5))
+
+(library
+ (name utils)
+ (public_name ptt.utils)
+ (modules utils)
  (libraries flux arc dmarc mnet-dns))
 
 (executable
  (name elit)
  (modules elit)
  (link_flags :standard -cclib "-z solo5-abi=hvt")
- (libraries cattery ptt.analyze ptt.ca ptt.cli ptt mirage-crypto-rng-mkernel gmp re mkernel mnet mnet-cli mnet-dns cmdliner logs.fmt logs.cli fmt.cli)
+ (libraries
+  cattery
+  ptt.utils
+  ptt.ca
+  ptt.cli
+  ptt
+  mirage-crypto-rng-mkernel
+  gmp
+  mfat
+  re
+  mkernel
+  mnet
+  mnet-cli
+  mnet-dns
+  cmdliner
+  logs.fmt
+  logs.cli
+  fmt.cli)
  (foreign_stubs
   (language c)
   (names manifest.elit)))
 
 (executable
- (name signer)
- (modules signer)
+ (name nec)
+ (modules nec)
  (link_flags :standard -cclib "-z solo5-abi=hvt")
- (libraries cattery ptt.analyze ptt.ca ptt.cli ptt mirage-crypto-rng-mkernel gmp re mkernel mnet mnet-cli mnet-dns cmdliner logs.fmt logs.cli fmt.cli)
+ (libraries
+  cattery
+  ptt.utils
+  ptt.dks
+  ptt.ca
+  ptt.cli
+  ptt
+  ptt.facteur
+  mirage-crypto-rng-mkernel
+  gmp
+  re
+  mkernel
+  mnet
+  mnet-cli
+  mnet-dns
+  cmdliner
+  logs.fmt
+  logs.cli
+  fmt.cli)
  (foreign_stubs
   (language c)
-  (names manifest.signer)))
+  (names manifest.nec)))
 
 (rule
  (targets manifest.elit.c)
@@ -36,11 +77,11 @@
   (write-file manifest.elit.c "")))
 
 (rule
- (targets manifest.signer.c)
+ (targets manifest.nec.c)
  (enabled_if
   (= %{context_name} "default"))
  (action
-  (write-file manifest.signer.c "")))
+  (write-file manifest.nec.c "")))
 
 (rule
  (targets manifest.elit.c)
@@ -51,9 +92,9 @@
   (run solo5-elftool gen-manifest manifest.elit.json manifest.elit.c)))
 
 (rule
- (targets manifest.signer.c)
- (deps manifest.signer.json)
+ (targets manifest.nec.c)
+ (deps manifest.nec.json)
  (enabled_if
   (= %{context_name} "solo5"))
  (action
-  (run solo5-elftool gen-manifest manifest.signer.json manifest.signer.c)))
+  (run solo5-elftool gen-manifest manifest.nec.json manifest.nec.c)))

@@ -5,7 +5,13 @@
  (libraries dns msendmail mrmime colombe))
 
 (library
+ (name facteur)
+ (public_name ptt.facteur)
+ (modules facteur aggregate)
+ (libraries ptt cattery dns colombe.emile emile msendmail))
+
+(library
  (name ptt_cli)
  (public_name ptt.cli)
  (modules ptt_cli)
- (libraries mnet-cli ptt cmdliner))
+ (libraries mnet-cli ptt ptt.facteur cmdliner))

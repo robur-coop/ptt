@@ -1,7 +1,19 @@
+module Blk = struct
+  type t = Mkernel.Block.t
+
+  let pagesize = Mkernel.Block.pagesize
+  let read = Mkernel.Block.atomic_read
+  let write = Mkernel.Block.atomic_write
+end
+
+module Fat = Mfat.Make (Blk)
 module RNG = Mirage_crypto_rng.Fortuna
+open Utils
 
 let ( let@ ) finally fn = Fun.protect ~finally fn
 let ( let* ) = Result.bind
+let ( / ) = Filename.concat
+let msgf fmt = Fmt.kstr (fun msg -> `Msg msg) fmt
 let error_msgf fmt = Fmt.kstr (fun msg -> Error (`Msg msg)) fmt
 let rng () = Mirage_crypto_rng_mkernel.initialize (module RNG)
 let rng = Mkernel.map rng Mkernel.[]
@@ -47,50 +59,76 @@ type value = {
   ; contents: Bstr.t
 }
 
-let save_into bstr =
-  let open Flux in
-  let init = Fun.const (0, bstr)
-  and push (dst_off, bstr) str =
-    let len = String.length str in
-    Bstr.blit_from_string str ~src_off:0 bstr ~dst_off ~len;
-    (dst_off + len, bstr)
-  and full (dst_off, bstr) = Bstr.length bstr = dst_off
-  and stop (len, bstr) = Bstr.sub bstr ~off:0 ~len in
-  Sink { init; push; full; stop }
+let aresults ~receiver ppf =
+  let open Prettym in
+  eval ppf
+    [
+      string $ "Authentication-Results"; char $ ':'; spaces 1
+    ; !!(Dmarc.Encoder.field ~receiver)
+    ]
 
-let pp_dkim ppf = function
-  | Dmarc.DKIM.Pass { dkim; _ } ->
-      let domain_name = Dkim.domain dkim in
-      Fmt.pf ppf "%a" Fmt.(styled (`Fg `Green) Domain_name.pp) domain_name
-  | Dmarc.DKIM.Fail { dkim; _ } | Dmarc.DKIM.Permerror { dkim; _ } ->
-      let domain_name = Dkim.domain dkim in
-      Fmt.pf ppf "%a" Fmt.(styled (`Fg `Red) Domain_name.pp) domain_name
-  | Dmarc.DKIM.Temperror { dkim; _ } ->
-      let domain_name = Dkim.domain dkim in
-      Fmt.pf ppf "%a" Fmt.(styled (`Fg `Yellow) Domain_name.pp) domain_name
-  | Dmarc.DKIM.Neutral _ -> ()
+let last_arc_set hdrs =
+  let is_arc_seal =
+    let open Mrmime.Field_name in
+    equal (v "ARC-Seal")
+  in
+  let get_arc_signature unstrctrd =
+    let* m = Dkim.of_unstrctrd_to_map unstrctrd in
+    let none = msgf "Missing i ARC field" in
+    let* i = Option.to_result ~none (Dkim.get_key "i" m) in
+    let none = msgf "Invalid unique ARC ID value" in
+    let* i = Option.to_result ~none (int_of_string_opt i) in
+    let* t = Dkim.map_to_t m in
+    Ok (i, t, m)
+  in
+  let rec go uid = function
+    | (field_name, unstrctrd) :: hdrs ->
+        if is_arc_seal field_name then
+          match get_arc_signature unstrctrd with
+          | Ok (uid', _, _) -> go (Int.max uid uid') hdrs
+          | Error _ -> go uid hdrs
+        else go uid hdrs
+    | [] -> uid
+  in
+  go 0 hdrs
 
-let pp_result ppf = function
-  | `Fail -> Fmt.pf ppf "%a" Fmt.(styled (`Fg `Red) string) "fail"
-  | `Pass -> Fmt.pf ppf "%a" Fmt.(styled (`Fg `Green) string) "green"
+let receiver ~info =
+  match info.Ptt.domain with
+  | Colombe.Domain.Domain ds -> `Domain ds
+  | IPv4 ipv4 -> `Addr (Emile.IPv4 ipv4)
+  | IPv6 ipv6 -> `Addr (Emile.IPv6 ipv6)
+  | Extension (k, v) -> `Addr (Emile.Ext (k, v))
 
-let pp_dmarc ppf = function
-  | Error err -> Analyze.pp_error ppf err
-  | Ok (info, dkims, result) ->
-      Fmt.pf ppf
-        "{ @[<hov>spf=@ @[<hov>%a@];@ dmarc=@ @[<hov>%a@];@ domain=@ %a;@ \
-         dkims=@ @[<hov>%a@];@ result=@ %a;@] }"
-        Uspf.Result.pp info.Dmarc.Verify.spf Dmarc.pp info.Dmarc.Verify.dmarc
-        Domain_name.pp info.Dmarc.Verify.domain
-        Fmt.(Dump.list pp_dkim)
-        dkims pp_result result
+type cfg = {
+    forward: Ipaddr.t -> bool
+  ; pool: value Cattery.t
+  ; resolver: Ptt.resolver
+  ; client: Facteur.t
+}
 
-let handler pool info dns resolver flow =
-  Cattery.use pool @@ fun v ->
+let resolver_according_to_peer ~cfg ~destination flow =
+  let _, (peer, _) = Mnet.TCP.peers flow in
+  match cfg.forward peer with
+  | true -> cfg.resolver
+  | false ->
+      let gethostbyname ipaddrs _ = Result.ok ipaddrs
+      and getmxbyname _ mail_exchange =
+        Ok (Dns.Rr_map.Mx_set.singleton { preference= 0; mail_exchange })
+      in
+      Ptt.Resolver { gethostbyname; getmxbyname; dns= [ destination ] }
+
+let to_forward ~cfg flow =
+  let _, (peer, _) = Mnet.TCP.peers flow in
+  cfg.forward peer
+
+let handler_mx ?(with_arc = false) ~cfg ~info:(sinfo, cinfo) dns destination
+    flow =
+  Cattery.use cfg.pool @@ fun v ->
+  let resolver = resolver_according_to_peer ~cfg ~destination flow in
+  let forward = to_forward ~cfg flow in
   let _, (peer, port) = Mnet.TCP.peers flow in
   let ic = Miou.Computation.create () in
   let oc = Miou.Computation.create () in
-  Logs.debug (fun m -> m "New client: %a:%d" Ipaddr.pp peer port);
   let q = Flux.Bqueue.(create with_close) 0x7ff in
   let prm0 =
     Miou.async @@ fun () ->
@@ -101,7 +139,8 @@ let handler pool info dns resolver flow =
     and decoder = Fun.const v.decoder
     and queue = Fun.const v.queue in
     match
-      Ptt.Relay.handler ~encoder ~decoder ~queue ~info resolver flow (ic, oc) q
+      Ptt.Relay.handler ~encoder ~decoder ~queue ~info:sinfo resolver flow
+        (ic, oc) q
     with
     | Ok () -> Miou.Ownership.disown resource
     | Error err ->
@@ -113,6 +152,15 @@ let handler pool info dns resolver flow =
   let prm1 =
     Miou.async @@ fun () ->
     match Miou.Computation.await_exn ic with
+    | m when forward ->
+        assert (Miou.Computation.try_return oc `Ok);
+        let from = Flux.Source.bqueue q in
+        let stream = Flux.Stream.from from in
+        let bstr = Flux.Stream.into (save_into v.contents) stream in
+        let seq = Seq.forever @@ fun () -> Flux.Stream.from (from_bstr bstr) in
+        let from = fst m.Ptt.from in
+        let recipients = List.map fst m.Ptt.recipients in
+        Facteur.sendmail cfg.client ~info:cinfo resolver ~from recipients seq
     | m ->
         assert (Miou.Computation.try_return oc `Ok);
         let from = Flux.Source.bqueue q in
@@ -123,18 +171,38 @@ let handler pool info dns resolver flow =
           let some v = Uspf.with_sender (`MAILFROM v) ctx in
           Option.fold ~none:ctx ~some (fst m.Ptt.from)
         in
-        let dmarc = Analyze.dmarc ~ctx dns in
+        let dmarc = dmarc ~ctx dns in
         let into =
           let open Flux.Sink.Syntax in
           let+ bstr = save_into v.contents
           and+ dmarc = dmarc
-          and+ hdrs = Analyze.headers in
+          and+ hdrs = headers in
           (bstr, hdrs, dmarc)
         in
-        let bstr, _hdrs, dmarc = Flux.Stream.into into stream in
-        let hash = Digestif.SHA256.digest_bigstring bstr in
-        Logs.debug (fun m -> m "New email: %a" Digestif.SHA256.pp hash);
-        Logs.debug (fun m -> m "DMARC result: %a" pp_dmarc dmarc)
+        let bstr, hdrs, dmarc = Flux.Stream.into into stream in
+        begin match (hdrs, dmarc) with
+        | Error err, _ ->
+            Logs.err (fun m ->
+                m "Invalid incoming email: %a" Utils.pp_error err)
+        | _, Error err ->
+            Logs.err (fun m -> m "DMARC error: %a" Utils.pp_error err)
+        | Ok hdrs, Ok dmarc ->
+            let aresults =
+              let receiver = receiver ~info:sinfo in
+              if with_arc then
+                let uid = last_arc_set hdrs in
+                Arc.Encoder.stamp_results ~receiver ~uid:(succ uid)
+              else aresults ~receiver
+            in
+            let aresults = Prettym.to_string ~new_line:"\r\n" aresults dmarc in
+            let s0 = Flux.Stream.from (Flux.Source.list [ aresults ]) in
+            let s1 = Flux.Stream.from (from_bstr bstr) in
+            let seq = Seq.forever @@ fun () -> Flux.Stream.concat s0 s1 in
+            let from = fst m.Ptt.from in
+            let recipients = List.map fst m.Ptt.recipients in
+            Facteur.sendmail cfg.client ~info:cinfo resolver ~from recipients
+              seq
+        end
     | exception Ptt.Recipients_unreachable ->
         Logs.err (fun m -> m "Given recipients are unreachable")
     | exception Handler_failed -> Logs.err (fun m -> m "Relay handler failed")
@@ -143,6 +211,111 @@ let handler pool info dns resolver flow =
   let () = Miou.await_exn prm1 in
   Mnet.TCP.close flow
 
+type user = {
+    username: [ `Dot_string of string list | `String of string ]
+  ; password: Digestif.SHA256.t
+  ; is_admin: bool
+}
+
+let user =
+  let open Digestif in
+  let open Jsont in
+  let open Object in
+  let local =
+    let dec str =
+      Angstrom.parse_string ~consume:All Colombe.Path.Decoder.local_part str
+      |> Result.error_to_failure
+    in
+    let enc = Colombe.Path.Encoder.local_to_string in
+    Jsont.map ~enc ~dec string
+  in
+  let sha256 =
+    let enc = SHA256.to_hex and dec = SHA256.of_hex in
+    Jsont.map ~enc ~dec string
+  in
+  Object.map (fun username password is_admin ->
+      let is_admin = Option.value ~default:false is_admin in
+      { username; password; is_admin })
+  |> mem "username" local
+  |> mem "password" sha256
+  |> opt_mem "is_admin" bool
+  |> Object.finish
+
+let auth fs username password =
+  let* users = Fat.ls fs "users/" in
+  let fn { Mfat.name; _ } = Eqaf.equal name username in
+  match List.find_opt fn users with
+  | Some { Mfat.name; is_dir= false; _ } ->
+      let str = Fat.read fs ("users" / name) in
+      let str = Result.get_ok str in
+      let* t =
+        Jsont_bytesrw.decode user (Bytesrw.Bytes.Reader.of_string str)
+        |> Result.map_error (fun _ -> msgf "Invalid JSON value for %s" username)
+      in
+      let password = Digestif.SHA256.digest_string password in
+      Ok (Digestif.SHA256.equal password t.password)
+  | _ -> Ok false
+
+let handler_submission ~cfg ~info:(sinfo, _cinfo) fs destination flow =
+  Cattery.use cfg.pool @@ fun v ->
+  let fd = Mnet_tls.file_descr flow in
+  let resolver = resolver_according_to_peer ~cfg ~destination fd in
+  let _, (peer, port) = Mnet.TCP.peers fd in
+  let ic = Miou.Computation.create () in
+  let oc = Miou.Computation.create () in
+  let q = Flux.Bqueue.(create with_close) 0x7ff in
+  let authentication =
+    let verify (`PLAIN stamp) value =
+      let* str = Base64.decode ~pad:false value in
+      match (stamp, String.split_on_char '\000' str) with
+      | None, "" :: username :: password ->
+          let password = String.concat "\000" password in
+          let* authentified = auth fs username password in
+          Ok (username, authentified)
+      | Some stamp', stamp :: username :: password when Eqaf.equal stamp stamp'
+        ->
+          let password = String.concat "\000" password in
+          let* authentified = auth fs username password in
+          Ok (username, authentified)
+      | _, _ :: username :: _ -> Ok (username, false)
+      | _ -> error_msgf "Invalid authentication"
+    in
+    ([ Ptt.Mechanism.PLAIN ], verify)
+  in
+  let prm0 =
+    Miou.async @@ fun () ->
+    let finally ic = assert (Miou.Computation.try_cancel ic handler_failed) in
+    let resource = Miou.Ownership.create ~finally ic in
+    Miou.Ownership.own resource;
+    let encoder = Fun.const v.encoder and decoder = Fun.const v.decoder in
+    match
+      Ptt.Submission.handler ~encoder ~decoder ~info:sinfo resolver
+        authentication flow (ic, oc) q
+    with
+    | Ok () -> Miou.Ownership.disown resource
+    | Error (`Msg msg) ->
+        Miou.Ownership.release resource;
+        Logs.err (fun m ->
+            m "%a:%d finished with an error: %s" Ipaddr.pp peer port msg)
+    | Error (#Ptt.Submission.error as err) ->
+        Miou.Ownership.release resource;
+        Logs.err (fun m ->
+            m "%a:%d finished with an error: %a" Ipaddr.pp peer port
+              Ptt.Submission.pp_error err)
+  in
+  let prm1 =
+    Miou.async @@ fun () ->
+    match Miou.Computation.await_exn ic with
+    | _m -> assert false
+    | exception Ptt.Recipients_unreachable ->
+        Logs.err (fun m -> m "Given recipients are unreachable")
+    | exception Handler_failed ->
+        Logs.err (fun m -> m "Submission handler failed")
+  in
+  let _ = Miou.await prm0 in
+  let () = Miou.await_exn prm1 in
+  Mnet_tls.close flow
+
 let rec clean_up orphans =
   match Miou.care orphans with
   | Some None | None -> ()
@@ -150,9 +323,51 @@ let rec clean_up orphans =
       let _ = Miou.await prm in
       clean_up orphans
 
-let run _ (cidrv4, gateway, ipv6) info resolver nameservers =
-  Mkernel.(run [ rng; Mnet.stack ~name:"service" ?gateway ~ipv6 cidrv4 ])
-  @@ fun rng (stack, tcp, udp) () ->
+let mx ?(with_arc = false) ~cfg ~info tcp dns destination =
+  let handler = handler_mx ~with_arc ~cfg ~info dns destination in
+  let rec go orphans listen =
+    clean_up orphans;
+    let flow = Mnet.TCP.accept tcp listen in
+    let _ = Miou.async ~orphans @@ fun () -> handler flow in
+    go orphans listen
+  in
+  go (Miou.orphans ()) (Mnet.TCP.listen tcp 25)
+
+let submission ~tls ~cfg ~info tcp fs destination =
+  let handler = handler_submission ~cfg ~info fs destination in
+  let rec go orphans listen =
+    clean_up orphans;
+    let flow = Mnet.TCP.accept tcp listen in
+    let _ =
+      Miou.async @@ fun () ->
+      match Mnet_tls.server_of_fd tls flow with
+      | flow -> handler flow
+      | exception exn ->
+          let (s, sp), (c, cp) = Mnet.TCP.peers flow in
+          Logs.err (fun m ->
+              m "Got an unexpected exception from %a:%d (on %a:%d): %s"
+                Ipaddr.pp c cp Ipaddr.pp s sp (Printexc.to_string exn));
+          Mnet.TCP.close flow
+    in
+    go orphans listen
+  in
+  go (Miou.orphans ()) (Mnet.TCP.listen tcp 587)
+
+let fat ~name =
+  let fn blk () =
+    let v = Fat.create blk in
+    let v = Result.map_error (fun (`Msg msg) -> msg) v in
+    Result.error_to_failure v
+  in
+  Mkernel.map fn [ Mkernel.block name ]
+
+let run _ (cidrv4, gateway, ipv6) info resolver nameservers forward_granted_for
+    dst0 dst1 with_arc =
+  let devices =
+    let open Mkernel in
+    [ rng; Mnet.stack ~name:"service" ?gateway ~ipv6 cidrv4; fat ~name:"elit" ]
+  in
+  Mkernel.run devices @@ fun rng (stack, tcp, udp) fs () ->
   let@ () = fun () -> Mirage_crypto_rng_mkernel.kill rng in
   let@ () = fun () -> Mnet.kill stack in
   let hed, he = Mnet_happy_eyeballs.create tcp in
@@ -161,30 +376,40 @@ let run _ (cidrv4, gateway, ipv6) info resolver nameservers =
   let t = Mnet_dns.transport dns in
   let@ () = fun () -> Mnet_dns.Transport.kill t in
   let seed = "TIDeanAhmWotZvWdrJntsKTwyAg16ysFhIYhSErjc8Q=" in
-  let result = CA.make (Colombe.Domain.to_string info.Ptt.domain) ~seed in
+  let result = CA.make (Colombe.Domain.to_string (fst info).Ptt.domain) ~seed in
   let cert, pk, _authenticator = Result.get_ok result in
   Logs.debug (fun m -> m "CA and certificate generated");
   let tls = Tls.Config.server ~certificates:(`Single ([ cert ], pk)) () in
   let tls = Result.get_ok tls in
-  let info = { info with Ptt.tls= Some tls } in
+  let info = ({ (fst info) with Ptt.tls= Some tls }, snd info) in
   let resolver = setup_resolver udp he resolver in
   let pool =
     Cattery.create 16 @@ fun () ->
     let encoder = Bytes.create 4096 in
     let decoder = Bytes.create 4096 in
     let queue = Ke.Rke.create Bigarray.char ~capacity:0x1000 in
-    let contents = Bstr.create info.size in
+    let contents = Bstr.create (fst info).size in
     { encoder; decoder; queue; contents }
   in
-  let rec go orphans listen =
-    clean_up orphans;
-    let flow = Mnet.TCP.accept tcp listen in
-    let _ =
-      Miou.async ~orphans @@ fun () -> handler pool info dns resolver flow
+  let client =
+    let pool =
+      Cattery.create 16 @@ fun () ->
+      let encoder = Bytes.create 4096 in
+      let decoder = Bytes.create 4096 in
+      let queue = Ke.Rke.create Bigarray.char ~capacity:0x1000 in
+      (encoder, decoder, queue)
     in
-    go orphans listen
+    { Facteur.he; pool }
   in
-  go (Miou.orphans ()) (Mnet.TCP.listen tcp 25)
+  let forward ipaddr =
+    let fn = Ipaddr.Prefix.mem ipaddr in
+    List.exists fn forward_granted_for
+  in
+  let cfg = { forward; pool; resolver; client } in
+  let prm0 = Miou.async @@ fun () -> mx ~with_arc ~cfg ~info tcp dns dst0 in
+  let prm1 = Miou.async @@ fun () -> submission ~tls ~cfg ~info tcp fs dst1 in
+  Miou.await_all [ prm0; prm1 ]
+  |> List.iter (function Ok () -> () | Error exn -> raise exn)
 
 open Cmdliner
 
@@ -289,6 +514,46 @@ let setup_resolution =
   let open Term in
   const setup_resolution $ setup_nameservers $ forward_to
 
+let mx_destination =
+  let doc =
+    "The SMTP destination for incoming emails on $(b,*:25) whose source IP \
+     address is not one of the addresses whose emails should be forwarded."
+  in
+  let parser = Ipaddr.of_string and pp = Ipaddr.pp in
+  let ipaddr = Arg.conv (parser, pp) in
+  let open Arg in
+  required
+  & opt (some ipaddr) None
+  & info [ "mx-destination" ] ~doc ~docv:"IPADDR"
+
+let submission_destination =
+  let doc =
+    "The SMTP destination for incoming emails on $(b,*:587) whose source IP \
+     address is not one of the addresses whose emails should be forwarded."
+  in
+  let parser = Ipaddr.of_string and pp = Ipaddr.pp in
+  let ipaddr = Arg.conv (parser, pp) in
+  let open Arg in
+  required
+  & opt (some ipaddr) None
+  & info [ "submission-destination" ] ~doc ~docv:"IPADDR"
+
+let forward_granted_for =
+  let doc = "Client emails whose received email should only be forwarded." in
+  let parser = Ipaddr.Prefix.of_string and pp = Ipaddr.Prefix.pp in
+  let cidr = Arg.conv (parser, pp) in
+  let open Arg in
+  value & opt_all cidr [] & info [ "forward-granted-for" ] ~doc ~docv:"CIDR"
+
+let with_arc =
+  let doc =
+    "Adds an ARC-Authentication-Results field to incoming emails (so that a \
+     signer can sign the email of a new ARC set). Otherwise, adds an \
+     Authentication-Results field."
+  in
+  let open Arg in
+  value & flag & info [ "with-arc" ] ~doc
+
 let term =
   let open Term in
   const run
@@ -297,6 +562,10 @@ let term =
   $ Ptt_cli.term_info
   $ setup_resolution
   $ setup_nameservers
+  $ forward_granted_for
+  $ mx_destination
+  $ submission_destination
+  $ with_arc
 
 let cmd =
   let info = Cmd.info "elit" in

@@ -32,3 +32,6 @@ val arc :
   -> Arc.key * Arc.key option
   -> Arc.Verify.chain
   -> (string, (Arc.Sign.set, [> error ]) result) Flux.sink
+
+val save_into : Bstr.t -> (string, Bstr.t) Flux.sink
+val from_bstr : ?len:int -> Bstr.t -> string Flux.source

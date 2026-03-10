@@ -38,6 +38,7 @@ type resolver =
 
 module SMTP = Smtp
 module SSMTP = Ssmtp
+module Mechanism = Mechanism
 
 let ( let* ) = Result.bind
 
@@ -238,16 +239,83 @@ module Submission = struct
     | `No_recipients
     | `Too_many_bad_commands
     | `Too_many_recipients
+    | `Too_many_tries
     | `Protocol of SSMTP.Value.error ]
 
-  type authenticator = ?payload:string -> Mechanism.t -> string * bool
-  type authentication = Mechanism.t list * authenticator
+  let pp_error ppf = function
+    | #user's_error as err -> pp_user's_error ppf err
+    | `Invalid_recipients -> Fmt.string ppf "Invalid recipients"
+    | `No_recipients -> Fmt.string ppf "No recipients"
+    | `Too_many_bad_commands -> Fmt.string ppf "Too many bad commands"
+    | `Too_many_recipients -> Fmt.string ppf "Too many recipients"
+    | `Too_many_tries -> Fmt.string ppf "Too many tries"
+    | `Protocol err -> SSMTP.Value.pp_error ppf err
 
-  let authentication ctx ~info (ms, authentication) flow =
+  type 'err authenticator =
+    [ `PLAIN of string option ] -> string -> (string * bool, 'err) result
+
+  type 'err authentication = Mechanism.t list * 'err authenticator
+
+  let bad_authentication ctx ~domain_from ms flow k =
+    let t =
+      let open SSMTP in
+      let open Monad in
+      let msg = [ "Bad authentication, buddy!" ] in
+      let* () = send ctx Value.PN_535 msg in
+      m_submission ctx ~domain_from ms
+    in
+    let* operation = run Msendmail.tls flow t in
+    match operation with
+    | `Quit -> Ok `Quit
+    | `Authentication (domain_from, mechanism) ->
+        k ~domain_from ?payload:None mechanism
+    | `Authentication_with_payload (domain_from, mechanism, payload) ->
+        k ~domain_from ?payload:(Some payload) mechanism
+
+  let authentication ctx ~info (ms, fn) flow =
     let rec go retries ~domain_from ?payload mechanism =
-      if retries <= 0 then assert false
+      if retries <= 0 then
+        let t =
+          let open SSMTP in
+          let msg = "Too many tries" in
+          m_properly_close_and_fail ctx msg
+        in
+        let* () = run Msendmail.tls flow t in
+        Error `Too_many_tries
       else
-        match authentication ?payload mechanism with
+        let k ~domain_from ?payload m =
+          go (retries - 1) ~domain_from ?payload m
+        in
+        match (mechanism, payload) with
+        | Mechanism.PLAIN, Some v ->
+            let* username, authentified = fn (`PLAIN None) v in
+            if authentified then
+              let msg = [ "Accepted, buddy!" ] in
+              let t = SSMTP.(Monad.send ctx Value.PP_235 msg) in
+              let* () = run Msendmail.tls flow t in
+              Ok (`Authenticated (domain_from, username))
+            else bad_authentication ctx ~domain_from ms flow k
+        | Mechanism.PLAIN, None ->
+            let stamp = Bytes.create 0x10 in
+            Mirage_crypto_rng.generate_into stamp 0x10;
+            let stamp = Bytes.unsafe_to_string stamp in
+            let t =
+              let open SSMTP in
+              let open Monad in
+              let* () =
+                send ctx Value.TP_334 [ Base64.encode_string ~pad:true stamp ]
+              in
+              recv ctx Value.Payload
+            in
+            let* v = run Msendmail.tls flow t in
+            let* username, authentified = fn (`PLAIN (Some stamp)) v in
+            if authentified then
+              let msg = [ "Accepted, buddy!" ] in
+              let t = SSMTP.(Monad.send ctx Value.PP_235 msg) in
+              let* () = run Msendmail.tls flow t in
+              Ok (`Authenticated (domain_from, username))
+            else bad_authentication ctx ~domain_from ms flow k
+      (*
         | username, true ->
             let msg = [ "Accepted, buddy!" ] in
             let t = SSMTP.(Monad.send ctx Value.PP_235 msg) in
@@ -269,6 +337,7 @@ module Submission = struct
             | `Authentication_with_payload (domain_from, mechanism, payload) ->
                 go (retries - 1) ~domain_from ~payload mechanism
           end
+*)
     in
     let t = SSMTP.m_submission_init ctx info ms in
     let* operation = run Msendmail.tls flow t in

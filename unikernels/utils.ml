@@ -41,7 +41,7 @@ let dmarc ~ctx dns =
         let decoder = Dmarc.Verify.src decoder str 0 len in
         until_await decoder
     | (`Continue _ | `Ok _ | `Error _) as value -> value
-  and full = function `Continue _ -> false | `Ok _ | `Error _ -> true
+  and full _ = false
   and stop = function
     | `Ok value -> Ok value
     | `Error err -> Error err
@@ -115,7 +115,9 @@ let chain dns =
             (* NOTE(dinosaure): should be safe. *)
             until_await decoder
       end
-    | `Malformed _ -> `Error `Invalid_email
+    | `Malformed msg ->
+        Logs.err (fun m -> m "Malformed email: %s" msg);
+        `Error `Invalid_email
     | `Chain chain -> `Ok chain
     | `Await decoder -> `Continue decoder
   in
@@ -131,7 +133,9 @@ let chain dns =
             (* NOTE(dinosaure): should be safe. *)
             until_chain decoder
       end
-    | `Malformed _ -> Error `Invalid_email
+    | `Malformed msg ->
+        Logs.err (fun m -> m "Malformed email: %s" msg);
+        Error `Invalid_email
     | `Chain chain -> Ok chain
     | `Await _ -> assert false
   in
@@ -142,7 +146,7 @@ let chain dns =
         let decoder = Arc.Verify.src decoder str 0 (String.length str) in
         until_await decoder
     | `Continue _ | `Ok _ | `Error _ -> state
-  and full = function `Continue _ -> false | _ -> true
+  and full _ = false
   and stop = function
     | `Error err -> Error err
     | `Ok chain -> Ok chain
@@ -162,13 +166,15 @@ let arc ~seal ~msgsig ~receiver ?results keys chain =
         Arc.Sign.sign t
     | `Await _ | `Set _ | `Malformed _ | `Missing_authentication_results ->
         state
-  and full = function `Await _ -> true | _ -> false in
+  and full = function `Await _ -> false | _ -> true in
   let rec stop = function
     | `Await t ->
         let t = Arc.Sign.fill t String.empty 0 0 in
         stop (Arc.Sign.sign t)
     | `Set set -> Ok set
-    | `Malformed _ -> Error `Invalid_email
+    | `Malformed msg ->
+        Logs.err (fun m -> m "Malformed email: %s" msg);
+        Error `Invalid_email
     | `Missing_authentication_results -> Error `Missing_authentication_results
   in
   Flux.Sink { init; push; full; stop }
@@ -234,7 +240,7 @@ let headers =
         let len = String.length str in
         Hd.src decoder str 0 len; until_await fields decoder
     | (`Continue _ | `Ok _ | `Error _) as value -> value
-  and full = function `Continue _ -> false | `Ok _ | `Error _ -> true
+  and full _ = false
   and stop = function
     | `Ok value -> Ok value
     | `Error err -> Error err
@@ -243,3 +249,29 @@ let headers =
         until_end fields decoder
   in
   Flux.Sink { init; push; full; stop }
+
+let save_into bstr =
+  let open Flux in
+  let init = Fun.const (0, bstr)
+  and push (dst_off, bstr) str =
+    let len = String.length str in
+    Bstr.blit_from_string str ~src_off:0 bstr ~dst_off ~len;
+    (dst_off + len, bstr)
+  and full (dst_off, bstr) = Bstr.length bstr = dst_off
+  and stop (len, bstr) = Bstr.sub bstr ~off:0 ~len in
+  Sink { init; push; full; stop }
+
+let from_bstr ?(len = 0x7ff) bstr =
+  let open Flux in
+  let buf = Bytes.create len in
+  let init = Fun.const 0
+  and pull src_off =
+    let len = Int.min (Bstr.length bstr - src_off) (Bytes.length buf) in
+    if len = 0 then None
+    else begin
+      Bstr.blit_to_bytes bstr ~src_off buf ~dst_off:0 ~len;
+      let str = Bytes.sub_string buf 0 len in
+      Some (str, src_off + len)
+    end
+  and stop = Fun.const () in
+  Source { init; pull; stop }

@@ -73,9 +73,58 @@ let size =
   let open Arg in
   value & opt size 10485760 (* 10MiB *) & info [ "limit" ] ~doc ~docv:"BYTES"
 
-let setup_info domain ipaddr zone size =
+let setup_server_info domain ipaddr zone size =
   { Ptt.domain; ipaddr; zone; size; tls= None }
+
+let term_server_info =
+  let open Term in
+  const setup_server_info $ domain $ ipaddr $ zone $ size
+
+let authenticator : (X509.Authenticator.t, [ `Msg of string ]) result Lazy.t =
+  Lazy.from_fun Ca_certs_nss.authenticator
+
+let tls_config user's_tls_config user's_authenticator =
+  match user's_tls_config with
+  | Some cfg -> Ok cfg
+  | None ->
+      let ( let* ) = Result.bind in
+      let* authenticator =
+        match (Lazy.force authenticator, user's_authenticator) with
+        | Ok authenticator, None -> Ok authenticator
+        | _, Some authenticator -> Ok authenticator
+        | Error (`Msg msg), None -> Error (`Msg msg)
+      in
+      Tls.Config.client ~authenticator ()
+
+let authenticator =
+  let parser str =
+    match X509.Authenticator.of_string str with
+    | Ok authenticator -> Ok (authenticator, str)
+    | Error _ as err -> err
+  in
+  let pp ppf (_, str) = Fmt.string ppf str in
+  Arg.conv ~docv:"AUTHENTICATOR" (parser, pp)
+
+let authenticator =
+  let doc = "The TLS authenticator used to verify TLS certificates." in
+  let open Arg in
+  value
+  & opt (some authenticator) None
+  & info [ "a"; "auth"; "authenticator" ] ~doc ~docv:"AUTHENTICATOR"
+
+let setup_client_info domain authenticator =
+  let now = Fun.compose Option.some Mirage_ptime.now in
+  let authenticator = Option.map (fun (fn, _) -> fn now) authenticator in
+  let tls = tls_config None (* TODO *) authenticator in
+  let tls = Result.get_ok tls in
+  { Facteur.domain; tls= Some tls }
+
+let term_client_info =
+  let open Term in
+  const setup_client_info $ domain $ authenticator
+
+let setup_info server_info client_info = (server_info, client_info)
 
 let term_info =
   let open Term in
-  const setup_info $ domain $ ipaddr $ zone $ size
+  const setup_info $ term_server_info $ term_client_info
