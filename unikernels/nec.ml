@@ -29,6 +29,7 @@ let private_key ?(count = 1) domain_name = function
   | PBKDF2 { password; alg } -> begin
       let salt = Domain_name.to_string domain_name ^ ":ptt" in
       let dk_len = 32l in
+      Logs.debug (fun m -> m "Generate a new key with count=%d" count);
       let seed = Pbkdf.pbkdf2 ~prf:`SHA256 ~password ~salt ~count ~dk_len in
       let g = Mirage_crypto_rng.(create ~seed (module Fortuna)) in
       match alg with
@@ -103,7 +104,7 @@ module ARC = struct
 
   let v ?(count = 1) ~(cfg : cfg) ~msgsig ?x:expiration ~selector pk domain_name
       =
-    let* key, alg = private_key domain_name pk in
+    let* key, alg = private_key ~count domain_name pk in
     let seal = of_cfg ~selector ~alg ?expiration cfg domain_name in
     let msgsig = DKIM.of_cfg ~selector ~alg ?expiration msgsig domain_name in
     let hash = cfg.hash in
@@ -166,7 +167,7 @@ let handler pool ~info:(sinfo, cinfo) client dns resolver flow t =
     | m, ARC t ->
         (* NOTE(dinosaure): The objective of this branch is to:
            1) retrieve the [ARC-Set] chain so that we can complete it with our
-              signature
+              ARC signature
            2) sign the email with our current private key
 
            It should be noted that [nec] does not perform DMARC verification.
@@ -213,7 +214,15 @@ let handler pool ~info:(sinfo, cinfo) client dns resolver flow t =
             let seq = Seq.forever @@ fun () -> Flux.Stream.concat s0 s1 in
             let from = fst m.Ptt.from in
             let recipients = List.map fst m.Ptt.recipients in
-            Facteur.sendmail client ~info:cinfo resolver ~from recipients seq
+            let errs =
+              Facteur.sendmail client ~info:cinfo resolver ~from recipients seq
+            in
+            let fn (dst, err) =
+              Logs.err (fun m ->
+                  m "Impossible to send emails to %a: %a" Facteur.Aggregate.pp
+                    dst Facteur.pp_error err)
+            in
+            List.iter fn errs
         | Error err ->
             Logs.err (fun m ->
                 m "Impossible to sign incoming email: %a" Utils.pp_error err)
@@ -245,7 +254,15 @@ let handler pool ~info:(sinfo, cinfo) client dns resolver flow t =
             let from = fst m.Ptt.from in
             let recipients = List.map fst m.Ptt.recipients in
             Logs.debug (fun m -> m "send signed email");
-            Facteur.sendmail client ~info:cinfo resolver ~from recipients seq
+            let errs =
+              Facteur.sendmail client ~info:cinfo resolver ~from recipients seq
+            in
+            let fn (dst, err) =
+              Logs.err (fun m ->
+                  m "Impossible to send emails to %a: %a" Facteur.Aggregate.pp
+                    dst Facteur.pp_error err)
+            in
+            List.iter fn errs
         | Error err ->
             Logs.err (fun m ->
                 m "Impossible to sign incoming email: %a" Utils.pp_error err)
@@ -265,12 +282,9 @@ let rec clean_up orphans =
       let _ = Miou.await prm in
       clean_up orphans
 
-[@@@warning "-27"]
-[@@@warning "-26"]
-
 let verify_and_update tcp dns primary dkim dk =
   Logs.debug (fun m ->
-      m "verify & update with %a => %S" Domain_name.pp (Dkim.selector dkim)
+      m "Verify & update with %a => %S" Domain_name.pp (Dkim.selector dkim)
         (Dkim.domain_key_to_string dk));
   let* set = Dks.verify dns dkim dk in
   match (set, primary) with
@@ -324,7 +338,7 @@ let expiration = function
       None
   | None -> None
 
-let get_domain_key_and_key info tcp dns primary (cfg : cfg) :
+let get_domain_key_and_key info tcp primary (cfg : cfg) :
     (t, [> Dks.error ]) result =
   let domain_name =
     match info.Ptt.domain with
@@ -346,16 +360,20 @@ let get_domain_key_and_key info tcp dns primary (cfg : cfg) :
       let dks = Dks.lint_and_sort self dks in
       let now = Mirage_ptime.now () in
       let count = List.length dks in
+      Logs.debug (fun m ->
+          m "Found %d domain-key(s) for our DKIM signature" count);
       begin match last_valid_domain_key ~now ?expiration:cfg.expiration dks with
-      | Some (epoch, selector, dk) ->
+      | Some (epoch, selector, _dk) ->
           Logs.debug (fun m ->
               m "found a valid and not yet expired recorded domain-key");
           let x = expiration_with_selectorf ~epoch cfg.expiration in
           let* v = DKIM.v ~count ~cfg ?x ~selector pk domain_name in
+          (* assert (Dkim.equal_domain_key _dk v.ARC.domain_key) *)
           Ok (DKIM v)
       | None ->
           let* selector = selectorf self in
           let x = expiration_with_selectorf cfg.expiration in
+          let count = Int.max 1 count in
           let* v = DKIM.v ~count ~cfg ?x ~selector pk domain_name in
           Ok (DKIM v)
       end
@@ -372,16 +390,19 @@ let get_domain_key_and_key info tcp dns primary (cfg : cfg) :
       let dks = Dks.lint_and_sort self dks in
       let now = Mirage_ptime.now () in
       let count = List.length dks in
+      Logs.debug (fun m -> m "Found %d domain-key(s) for our ARC-Set" count);
       begin match last_valid_domain_key ~now ?expiration:cfg.expiration dks with
-      | Some (epoch, selector, dk) ->
+      | Some (epoch, selector, _dk) ->
           Logs.debug (fun m ->
-              m "found a valid and not yet expired recorded domain-key");
+              m "Found a valid and not yet expired recorded domain-key");
           let x = expiration_with_selectorf ~epoch cfg.expiration in
           let* v = ARC.v ~count ~cfg ~msgsig ?x ~selector pk domain_name in
+          (* assert (Dkim.equal_domain_key _dk v.DKIM.domain_key) *)
           Ok (ARC v)
       | None ->
           let* selector = selectorf self in
           let x = expiration_with_selectorf cfg.expiration in
+          let count = Int.max 1 count in
           let* v = ARC.v ~count ~cfg ~msgsig ?x ~selector pk domain_name in
           Ok (ARC v)
       end
@@ -397,7 +418,11 @@ let get_domain_key_and_key info tcp dns primary (cfg : cfg) :
  *)
 
 let _5s = 5_000_000_000
-let expiration = function DKIM t -> Dkim.expire t.dkim | ARC _ -> assert false
+
+let expiration = function
+  | DKIM t -> Dkim.expire t.dkim
+  | ARC t -> Arc.Sign.expire t.seal
+
 let count = function DKIM t -> t.count | ARC _ -> assert false
 let domain_name = function DKIM t -> t.domain_name | ARC t -> t.domain_name
 let pk = function DKIM t -> t.pk | ARC t -> t.pk
@@ -461,13 +486,12 @@ let rec renew tcp dns primary ~expiration:span ~self t =
       end;
       renew tcp dns primary ~expiration:span ~self t
 
-let renew tcp dns primary ?expiration (cfg : cfg) t =
+let renew tcp dns primary (cfg : cfg) t =
   match (cfg, primary) with
-  | DKIM { selector= `Fmt self; expiration= Some (`For expiration); _ }, Some _
-    ->
-      let prm =
-        Miou.async @@ fun () -> renew tcp dns primary ~expiration ~self t
-      in
+  | DKIM { selector= `Fmt self; expiration= Some (`For x); _ }, Some _
+  | ARC ({ selector= `Fmt self; expiration= Some (`For x); _ }, _), Some _ ->
+      let fn () = renew tcp dns primary ~expiration:x ~self t in
+      let prm = Miou.async fn in
       Some prm
   | _ -> None
 
@@ -487,13 +511,6 @@ let run _ (cidrv4, gateway, ipv6) info nameservers destination cfg primary
   let dns = Mnet_dns.create ~nameservers (udp, he) in
   let t = Mnet_dns.transport dns in
   let@ () = fun () -> Mnet_dns.Transport.kill t in
-  let seed = "TIDeanAhmWotZvWdrJntsKTwyAg16ysFhIYhSErjc8Q=" in
-  let result = CA.make (Colombe.Domain.to_string (fst info).Ptt.domain) ~seed in
-  let cert, pk, _authenticator = Result.get_ok result in
-  Logs.debug (fun m -> m "CA and certificate generated");
-  let tls = Tls.Config.server ~certificates:(`Single ([ cert ], pk)) () in
-  let tls = Result.get_ok tls in
-  let info = ({ (fst info) with Ptt.tls= Some tls }, snd info) in
   let pool =
     Cattery.create 16 @@ fun () ->
     let encoder = Bytes.create 4096 in
@@ -519,7 +536,7 @@ let run _ (cidrv4, gateway, ipv6) info nameservers destination cfg primary
     in
     Ptt.Resolver { gethostbyname; getmxbyname; dns= [ destination ] }
   in
-  let* t = get_domain_key_and_key (fst info) tcp dns primary cfg in
+  let* t = get_domain_key_and_key (fst info) tcp primary cfg in
   let* () =
     let dkim = match t with ARC t -> t.msgsig | DKIM t -> t.dkim in
     let dk = match t with ARC t -> t.domain_key | DKIM t -> t.domain_key in
@@ -534,6 +551,7 @@ let run _ (cidrv4, gateway, ipv6) info nameservers destination cfg primary
   let@ () = fun () -> Option.iter Miou.cancel prm in
   let rec go orphans listen =
     clean_up orphans;
+    Logs.debug (fun m -> m "Waiting for a new connection");
     let flow = Mnet.TCP.accept tcp listen in
     let _ =
       Miou.async ~orphans @@ fun () ->
@@ -645,8 +663,8 @@ let expiration =
         if Ptime.is_earlier ptime ~than then
           error_msgf "An expiration must be in the futur"
         else Ok (`At ptime)
-    | Error _ -> begin
-        match Duration.of_string_exn str with
+    | Error _ ->
+        begin match Duration.of_string_exn str with
         | nsec ->
             let days = Int64.div nsec nsec_per_day in
             let rem_ns = Int64.rem nsec nsec_per_day in
@@ -657,7 +675,7 @@ let expiration =
         | exception _exn ->
             error_msgf
               "Invalid expiration value (must be a date or a duration): %S" str
-      end
+        end
   in
   let pp ppf = function
     | `At v -> Ptime.pp_rfc3339 () ppf v

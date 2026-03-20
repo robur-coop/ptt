@@ -36,6 +36,7 @@ type resolver =
       -> resolver
 
 exception Recipients_unreachable
+exception Quit
 
 type user's_error =
   [ `Aborted

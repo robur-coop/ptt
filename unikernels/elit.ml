@@ -9,12 +9,39 @@ end
 module Fat = Mfat.Make (Blk)
 module RNG = Mirage_crypto_rng.Fortuna
 open Utils
+module SM = Map.Make (String)
 
 let ( let@ ) finally fn = Fun.protect ~finally fn
 let ( let* ) = Result.bind
 let ( / ) = Filename.concat
 let msgf fmt = Fmt.kstr (fun msg -> `Msg msg) fmt
 let error_msgf fmt = Fmt.kstr (fun msg -> Error (`Msg msg)) fmt
+
+let gen_id =
+  let counter = Atomic.make 0 in
+  fun () ->
+    let n = Atomic.fetch_and_add counter 1 in
+    Printf.sprintf "%d-%d" (Stdlib.Domain.self () :> int) n
+
+let find_list lists rcpt_local rcpt_domain =
+  SM.fold
+    (fun name lst acc ->
+      match acc with
+      | Some _ -> acc
+      | None ->
+          let lst_domain = Colombe.Domain.to_string lst.Mlm.domain in
+          if not (String.equal lst_domain rcpt_domain) then None
+          else
+            let nlen = String.length name in
+            let rlen = String.length rcpt_local in
+            if
+              rlen >= nlen
+              && String.sub rcpt_local 0 nlen = name
+              && (rlen = nlen || rcpt_local.[nlen] = '-')
+            then Some lst
+            else None)
+    lists None
+
 let rng () = Mirage_crypto_rng_mkernel.initialize (module RNG)
 let rng = Mkernel.map rng Mkernel.[]
 
@@ -104,7 +131,43 @@ type cfg = {
   ; pool: value Cattery.t
   ; resolver: Ptt.resolver
   ; client: Facteur.t
+  ; lists: Mlm.t SM.t ref
+  ; save_list: Mlm.t -> unit
 }
+
+let rec send_mlm_outgoing ~cfg ~info resolver lst outgoing =
+  List.fold_left
+    (fun lst (out : Mlm.outgoing) ->
+      let from = out.Mlm.sender in
+      let recipients = out.Mlm.recipients in
+      match recipients with
+      | _ :: _ ->
+          let seq =
+            Seq.forever @@ fun () ->
+            Flux.Stream.from (Flux.Source.list [ out.Mlm.data ])
+          in
+          let errors =
+            Facteur.sendmail cfg.client ~info resolver ~from recipients seq
+          in
+          if errors <> [] then begin
+            match from with
+            | Some verp_path ->
+                let verp_fp = Colombe.Forward_path.Forward_path verp_path in
+                (match
+                   Mlm.incoming ~gen_id lst ~from:None ~rcpt:verp_fp ~mail:""
+                 with
+                 | Ok (lst', bounce_out) ->
+                     ignore
+                       (send_mlm_outgoing ~cfg ~info resolver lst' bounce_out);
+                     lst'
+                 | Error () -> lst)
+            | None -> lst
+          end
+          else lst
+      | [] ->
+          Logs.warn (fun m -> m "MLM: no recipients for outgoing email");
+          lst)
+    lst outgoing
 
 let resolver_according_to_peer ~cfg ~destination flow =
   let _, (peer, _) = Mnet.TCP.peers flow in
@@ -160,48 +223,96 @@ let handler_mx ?(with_arc = false) ~cfg ~info:(sinfo, cinfo) dns destination
         let seq = Seq.forever @@ fun () -> Flux.Stream.from (from_bstr bstr) in
         let from = fst m.Ptt.from in
         let recipients = List.map fst m.Ptt.recipients in
-        Facteur.sendmail cfg.client ~info:cinfo resolver ~from recipients seq
+        ignore
+          (Facteur.sendmail cfg.client ~info:cinfo resolver ~from recipients seq)
     | m ->
         assert (Miou.Computation.try_return oc `Ok);
-        let from = Flux.Source.bqueue q in
-        let stream = Flux.Stream.from from in
+        let from_source = Flux.Source.bqueue q in
+        let stream = Flux.Stream.from from_source in
+        let from = fst m.Ptt.from in
+        let list_rcpts, other_rcpts =
+          List.fold_right
+            (fun (fp, params) (lists, others) ->
+              match fp with
+              | Colombe.Forward_path.Forward_path path -> (
+                  let local =
+                    Colombe.Path.Encoder.local_to_string path.Colombe.Path.local
+                  in
+                  let domain =
+                    Colombe.Domain.to_string path.Colombe.Path.domain
+                  in
+                  match find_list !(cfg.lists) local domain with
+                  | Some lst -> ((lst, fp) :: lists, others)
+                  | None -> (lists, (fp, params) :: others))
+              | _ -> (lists, (fp, params) :: others))
+            m.Ptt.recipients ([], [])
+        in
         let ctx = Uspf.empty in
         let ctx = Uspf.with_ip peer ctx in
         let ctx =
           let some v = Uspf.with_sender (`MAILFROM v) ctx in
           Option.fold ~none:ctx ~some (fst m.Ptt.from)
         in
-        let dmarc = dmarc ~ctx dns in
         let into =
           let open Flux.Sink.Syntax in
           let+ bstr = save_into v.contents
-          and+ dmarc = dmarc
+          and+ dmarc = dmarc ~ctx dns
           and+ hdrs = headers in
           (bstr, hdrs, dmarc)
         in
-        let bstr, hdrs, dmarc = Flux.Stream.into into stream in
-        begin match (hdrs, dmarc) with
-        | Error err, _ ->
-            Logs.err (fun m ->
-                m "Invalid incoming email: %a" Utils.pp_error err)
-        | _, Error err ->
-            Logs.err (fun m -> m "DMARC error: %a" Utils.pp_error err)
-        | Ok hdrs, Ok dmarc ->
-            let aresults =
-              let receiver = receiver ~info:sinfo in
-              if with_arc then
-                let uid = last_arc_set hdrs in
-                Arc.Encoder.stamp_results ~receiver ~uid:(succ uid)
-              else aresults ~receiver
-            in
-            let aresults = Prettym.to_string ~new_line:"\r\n" aresults dmarc in
-            let s0 = Flux.Stream.from (Flux.Source.list [ aresults ]) in
-            let s1 = Flux.Stream.from (from_bstr bstr) in
-            let seq = Seq.forever @@ fun () -> Flux.Stream.concat s0 s1 in
-            let from = fst m.Ptt.from in
-            let recipients = List.map fst m.Ptt.recipients in
-            Facteur.sendmail cfg.client ~info:cinfo resolver ~from recipients
-              seq
+        let bstr, hdrs, dmarc_result = Flux.Stream.into into stream in
+        if list_rcpts <> [] then begin
+          let max_size = sinfo.Ptt.size in
+          let mail_len = Bstr.length bstr in
+          if mail_len > max_size then
+            Logs.warn (fun m ->
+                m "MLM: email too large (%d bytes, max %d)" mail_len max_size)
+          else begin
+            let mail = Bstr.to_string bstr in
+            List.iter
+              (fun (lst, rcpt_fp) ->
+                match
+                  Mlm.incoming ~gen_id lst ~from ~rcpt:rcpt_fp ~mail
+                with
+                | Ok (lst', outgoing) ->
+                    let lst' =
+                      send_mlm_outgoing ~cfg ~info:cinfo resolver lst' outgoing
+                    in
+                    cfg.lists := SM.add lst'.Mlm.name lst' !(cfg.lists);
+                    cfg.save_list lst'
+                | Error () ->
+                    Logs.warn (fun m ->
+                        m "MLM: no matching handler for %a"
+                          Colombe.Forward_path.pp rcpt_fp))
+              list_rcpts
+          end
+        end;
+        if other_rcpts <> [] then begin
+          match (hdrs, dmarc_result) with
+          | Error err, _ ->
+              Logs.err (fun m ->
+                  m "Invalid incoming email: %a" Utils.pp_error err)
+          | _, Error err ->
+              Logs.err (fun m -> m "DMARC error: %a" Utils.pp_error err)
+          | Ok hdrs, Ok dmarc ->
+              let aresults =
+                let receiver = receiver ~info:sinfo in
+                if with_arc then
+                  let uid = last_arc_set hdrs in
+                  Arc.Encoder.stamp_results ~receiver ~uid:(succ uid)
+                else aresults ~receiver
+              in
+              let aresults =
+                Prettym.to_string ~new_line:"\r\n" aresults dmarc
+              in
+              let s0 = Flux.Stream.from (Flux.Source.list [ aresults ]) in
+              let s1 = Flux.Stream.from (from_bstr bstr) in
+              let seq = Seq.forever @@ fun () -> Flux.Stream.concat s0 s1 in
+              let from = fst m.Ptt.from in
+              let recipients = List.map fst other_rcpts in
+              ignore
+                (Facteur.sendmail cfg.client ~info:cinfo resolver ~from
+                   recipients seq)
         end
     | exception Ptt.Recipients_unreachable ->
         Logs.err (fun m -> m "Given recipients are unreachable")
@@ -405,7 +516,49 @@ let run _ (cidrv4, gateway, ipv6) info resolver nameservers forward_granted_for
     let fn = Ipaddr.Prefix.mem ipaddr in
     List.exists fn forward_granted_for
   in
-  let cfg = { forward; pool; resolver; client } in
+  let lists =
+    let load () =
+      match Fat.ls fs "lists/" with
+      | Ok entries ->
+          List.fold_left
+            (fun acc entry ->
+              if
+                (not entry.Mfat.is_dir)
+                && Filename.check_suffix entry.Mfat.name ".conf"
+              then (
+                match Fat.read fs ("lists" / entry.Mfat.name) with
+                | Ok data ->
+                    let lst =
+                      Mlm.of_config ~domain:(fst info).Ptt.domain data
+                    in
+                    Logs.info (fun m ->
+                        m "Loaded mailing list: %s" lst.Mlm.name);
+                    SM.add lst.Mlm.name lst acc
+                | Error (`Msg msg) ->
+                    Logs.warn (fun m ->
+                        m "Cannot read list %s: %s" entry.Mfat.name msg);
+                    acc)
+              else acc)
+            SM.empty entries
+      | Error _ ->
+          (match Fat.mkdir fs "lists" with
+          | Ok () -> Logs.info (fun m -> m "Created lists/ directory")
+          | Error (`Msg msg) ->
+              Logs.warn (fun m -> m "Cannot create lists/ directory: %s" msg));
+          SM.empty
+    in
+    ref (load ())
+  in
+  let save_list lst =
+    let data = Mlm.to_config lst in
+    let path = "lists" / (lst.Mlm.name ^ ".conf") in
+    match Fat.write fs path data with
+    | Ok () ->
+        Logs.debug (fun m -> m "Saved mailing list state: %s" lst.Mlm.name)
+    | Error (`Msg msg) ->
+        Logs.err (fun m -> m "Failed to save list %s: %s" lst.Mlm.name msg)
+  in
+  let cfg = { forward; pool; resolver; client; lists; save_list } in
   let prm0 = Miou.async @@ fun () -> mx ~with_arc ~cfg ~info tcp dns dst0 in
   let prm1 = Miou.async @@ fun () -> submission ~tls ~cfg ~info tcp fs dst1 in
   Miou.await_all [ prm0; prm1 ]

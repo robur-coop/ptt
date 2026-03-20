@@ -18,14 +18,14 @@ let pp_locals ppf = function
   | `All -> Fmt.string ppf "all"
   | `Postmaster -> Fmt.string ppf "postmaster"
   | `Some locals ->
-      Fmt.pf ppf "@[<hov>%a@]" Fmt.(Dump.list Emile.pp_local) locals
+      Fmt.pf ppf "%a" Fmt.(list ~sep:(any ",") Emile.pp_local) locals
 
 let pp_domain ppf = function
   | `Ipaddr ipaddr -> Ipaddr.pp ppf ipaddr
   | `Domain domain_name -> Domain_name.pp ppf domain_name
 
 let pp ppf { domain; locals } =
-  Fmt.pf ppf "@@%a:@[<hov>%a@]" pp_domain domain pp_locals locals
+  Fmt.pf ppf "@@%a:%a" pp_domain domain pp_locals locals
 
 let of_strings sstr =
   let open Result.Syntax in
@@ -60,16 +60,16 @@ let aggregate_by_domains ~domain =
   let open Colombe in
   let open Forward_path in
   let fold (by_domains, by_ipaddrs) = function
-    | Postmaster -> begin
-        match domain with
+    | Postmaster ->
+        begin match domain with
         | Colombe.Domain.(IPv4 _ | IPv6 _ | Extension _) ->
             Log.err (fun m ->
                 m
                   "The SMTP server domain is not a domain-name, impossible to \
                    add the postmaster as a recipient");
             (by_domains, by_ipaddrs)
-        | Colombe.Domain.Domain ds -> begin
-            match of_strings ds with
+        | Colombe.Domain.Domain ds ->
+            begin match of_strings ds with
             | Ok domain ->
                 (add_by_domain ~domain `Postmaster by_domains, by_ipaddrs)
             | Error (`Msg _) ->
@@ -78,11 +78,11 @@ let aggregate_by_domains ~domain =
                       "Invalid SMTP server domain, impossible to add the \
                        postmaster as a recipient");
                 (by_domains, by_ipaddrs)
-          end
-      end
+            end
+        end
     | Forward_path { Path.domain= Domain.Domain v; Path.local; _ } as recipient
-      -> begin
-        match of_strings v with
+      ->
+        begin match of_strings v with
         | Ok domain ->
             let local = Colombe_emile.of_local local in
             (add_by_domain ~domain (`Some local) by_domains, by_ipaddrs)
@@ -91,16 +91,16 @@ let aggregate_by_domains ~domain =
                 m "Invalid domain for %a, ignore it: %s" Forward_path.pp
                   recipient msg);
             (by_domains, by_ipaddrs)
-      end
-    | Domain (Domain.Domain v) as recipient -> begin
-        match of_strings v with
+        end
+    | Domain (Domain.Domain v) as recipient ->
+        begin match of_strings v with
         | Ok domain -> (add_by_domain ~domain `All by_domains, by_ipaddrs)
         | Error (`Msg msg) ->
             Log.warn (fun m ->
                 m "Invalid domain for %a, ignore it: %s" Forward_path.pp
                   recipient msg);
             (by_domains, by_ipaddrs)
-      end
+        end
     | Domain (Domain.IPv4 v4) ->
         (by_domains, add_by_ipaddr (Ipaddr.V4 v4) `All by_ipaddrs)
     | Domain (Domain.IPv6 v6) ->

@@ -11,36 +11,44 @@
  (libraries dkim mnet mnet-dns dns dns-tsig x509 mirage-ptime.solo5))
 
 (library
+ (name cert)
+ (public_name ptt.cert)
+ (modules cert)
+ (libraries mnet mirage-ptime dns-certify))
+
+(library
  (name utils)
  (public_name ptt.utils)
  (modules utils)
  (libraries flux arc dmarc mnet-dns))
 
-(executable
- (name elit)
- (modules elit)
- (link_flags :standard -cclib "-z solo5-abi=hvt")
- (libraries
-  cattery
-  ptt.utils
-  ptt.ca
-  ptt.cli
-  ptt
-  mirage-crypto-rng-mkernel
-  gmp
-  mfat
-  re
-  mkernel
-  mnet
-  mnet-cli
-  mnet-dns
-  cmdliner
-  logs.fmt
-  logs.cli
-  fmt.cli)
- (foreign_stubs
-  (language c)
-  (names manifest.elit)))
+; (executable
+;  (name elit)
+;  (modules elit)
+;  (link_flags :standard -cclib "-z solo5-abi=hvt")
+;  (libraries
+;   cattery
+;   ptt.utils
+;   ptt.ca
+;   ptt.cli
+;   ptt
+;   ptt.mlm
+;   ptt.facteur
+;   mirage-crypto-rng-mkernel
+;   gmp
+;   mfat
+;   re
+;   mkernel
+;   mnet
+;   mnet-cli
+;   mnet-dns
+;   cmdliner
+;   logs.fmt
+;   logs.cli
+;   fmt.cli)
+;  (foreign_stubs
+;   (language c)
+;   (names manifest.elit)))
 
 (executable
  (name nec)
@@ -68,6 +76,53 @@
  (foreign_stubs
   (language c)
   (names manifest.nec)))
+
+(executable
+ (name lipap)
+ (modules lipap)
+ (link_flags :standard -cclib "-z solo5-abi=hvt")
+ (libraries
+  cattery
+  ptt.utils
+  ptt.cert
+  ptt.ca
+  ptt.cli
+  ptt
+  ptt.mlm
+  ptt.facteur
+  msendmail
+  jsont.bytesrw
+  bytesrw
+  mirage-crypto-rng-mkernel
+  gmp
+  mfat
+  re
+  mkernel
+  mnet
+  mnet-cli
+  mnet-dns
+  cmdliner
+  logs.fmt
+  logs.cli
+  fmt.cli)
+ (foreign_stubs
+  (language c)
+  (names manifest.lipap)))
+
+(rule
+ (targets manifest.lipap.c)
+ (enabled_if
+  (= %{context_name} "default"))
+ (action
+  (write-file manifest.lipap.c "")))
+
+(rule
+ (targets manifest.lipap.c)
+ (deps manifest.lipap.json)
+ (enabled_if
+  (= %{context_name} "solo5"))
+ (action
+  (run solo5-elftool gen-manifest manifest.lipap.json manifest.lipap.c)))
 
 (rule
  (targets manifest.elit.c)

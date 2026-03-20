@@ -1,3 +1,7 @@
+let src = Logs.Src.create "dks"
+
+module Log = (val Logs.src_log src : Logs.LOG)
+
 let ( let* ) = Result.bind
 let ( let@ ) finally fn = Fun.protect ~finally fn
 let error_msgf fmt = Fmt.kstr (fun msg -> Error (`Msg msg)) fmt
@@ -23,12 +27,14 @@ let pp_error ppf = function
 let verify dns dkim dk =
   let* domain_name = Dkim.Verify.domain_key dkim in
   match Mnet_dns.get_resource_record dns Dns.Rr_map.Txt domain_name with
-  | Error (`No_data _) -> Ok false
-  | Error (`No_domain _) -> Ok false
+  | Error (`No_data _) | Error (`No_domain _) ->
+      Log.debug (fun m -> m "%a does not exist" Domain_name.pp domain_name);
+      Ok false
   | Error (`Msg msg) -> Error (`Msg msg)
   | Ok (_, sstr) ->
       let sstr = Dns.Rr_map.Txt_set.elements sstr in
       let str = String.concat "" sstr in
+      Log.debug (fun m -> m "Get %a:%s" Domain_name.pp domain_name str);
       let* dk' = Dkim.domain_key_of_string str in
       let expired = Option.map Int64.to_float (Dkim.expire dkim) in
       let expired = Option.map Ptime.of_float_s expired in
@@ -36,7 +42,12 @@ let verify dns dkim dk =
       let than = Mirage_ptime.now () in
       let expired = Option.map (Ptime.is_later ~than) expired in
       let expired = Option.value ~default:false expired in
+      Log.debug (fun m -> m "%a expired? %b" Domain_name.pp domain_name expired);
       Ok (Dkim.equal_domain_key dk dk' && not expired)
+
+type selector = Selector : { prj: prj; inj: inj; raw: string } -> selector
+and prj = (int -> string, Format.formatter, unit, string) format4
+and inj = (int -> int, Scanf.Scanning.scanbuf, (int -> int) -> int, int) format4
 
 let domain_keys tcp dns_server (dns_key_name, dns_key) domain_name =
   let flags = Dns.Packet.Flags.empty in
@@ -130,6 +141,8 @@ let update tcp dns_server (dns_key_name, dns_key) dkim dk =
   let len = Bytes.create 2 in
   Bytes.set_uint16_be len 0 (String.length data);
   let len = Bytes.unsafe_to_string len in
+  Log.debug (fun m ->
+      m "Add %a:%S" Domain_name.pp selector (Dkim.domain_key_to_string dk));
   Mnet.TCP.write flow len;
   Mnet.TCP.write flow data;
   let len = Bytes.create 2 in
@@ -145,11 +158,10 @@ let update tcp dns_server (dns_key_name, dns_key) dkim dk =
   in
   match Dns.Packet.reply_matches_request ~request:pkt pkt' with
   | Ok _ -> Ok ()
-  | Error (#Dns.Packet.mismatch as err) -> Error err
-
-type selector = Selector : { prj: prj; inj: inj; raw: string } -> selector
-and prj = (int -> string, Format.formatter, unit, string) format4
-and inj = (int -> int, Scanf.Scanning.scanbuf, (int -> int) -> int, int) format4
+  | Error (#Dns.Packet.mismatch as err) ->
+      Log.err (fun m ->
+          m "Impossible to update/create %a" Domain_name.pp selector);
+      Error err
 
 let lint_and_sort (Selector { inj; _ }) dks =
   let fn (selector, dk) =

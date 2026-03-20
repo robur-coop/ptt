@@ -15,3 +15,9 @@
  (public_name ptt.cli)
  (modules ptt_cli)
  (libraries mnet-cli ptt ptt.facteur cmdliner))
+
+(library
+ (name mlm)
+ (public_name ptt.mlm)
+ (modules mlm)
+ (libraries hxd.string hxd.core colombe.emile flux logs mrmime prettym colombe bstr jsont))

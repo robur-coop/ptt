@@ -92,10 +92,15 @@ let merge result user's_result =
 exception Extension_is_not_available of Colombe.Forward_path.t
 exception Invalid_recipients of Colombe.Forward_path.t
 exception Recipients_unreachable
+exception Quit
 
 let recipients_unreachable =
   let bt = Printexc.get_callstack 0 in
   (Recipients_unreachable, bt)
+
+let quit =
+  let bt = Printexc.get_callstack 0 in
+  (Quit, bt)
 
 let recipients_are_reachable ~info
     (Resolver { dns; gethostbyname; getmxbyname }) recipients =
@@ -111,8 +116,7 @@ let recipients_are_reachable ~info
           raise (Extension_is_not_available value)
       | ( Domain (Domain.Domain domain)
         | Forward_path { Path.domain= Domain.Domain domain; _ } ) as value ->
-        begin
-          if Domain.equal (Domain.Domain domain) info.domain then acc
+          begin if Domain.equal (Domain.Domain domain) info.domain then acc
           else
             let domain_name =
               let open Domain_name in
@@ -121,7 +125,7 @@ let recipients_are_reachable ~info
             match domain_name with
             | Ok domain_name -> Domain_name.Host_set.add domain_name acc
             | Error _ -> raise (Invalid_recipients value)
-        end
+          end
     in
     List.fold_left fn Domain_name.Host_set.empty recipients
     |> Domain_name.Host_set.elements
@@ -188,9 +192,13 @@ module Relay = struct
     Log.debug (fun m -> m "Initiate a new SMTP connection");
     let* operation = run Msendmail.tcp flow t in
     match operation with
-    | `Quit -> properly_close_starttls ctx flow
+    | `Quit ->
+        let* () = properly_close_starttls ctx flow in
+        assert (Miou.Computation.try_cancel ic quit);
+        Ok ()
     | `Send ({ SMTP.recipients; _ } as m)
       when recipients_are_reachable ~info dns (List.map fst recipients) ->
+        Log.debug (fun m -> m "New incoming email");
         assert (Miou.Computation.try_return ic m);
         let t = SMTP.m_mail ctx in
         let* () = run Msendmail.tcp flow t in
@@ -209,7 +217,10 @@ module Relay = struct
             | Ok ".." ->
                 Flux.Bqueue.put q ".\r\n";
                 go (size + 3)
-            | Ok "." -> Flux.Bqueue.close q; Ok ()
+            | Ok "." ->
+                Log.debug (fun m -> m "Receive an email of %d byte(s)" size);
+                Flux.Bqueue.close q;
+                Ok ()
             | Error _ as err -> Flux.Bqueue.close q; err
             | Ok line ->
                 Flux.Bqueue.put q (line ^ "\r\n");
