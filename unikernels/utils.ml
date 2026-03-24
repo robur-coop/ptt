@@ -1,3 +1,6 @@
+let msgf fmt = Fmt.kstr (fun msg -> `Msg msg) fmt
+let error_msgf fmt = Fmt.kstr (fun msg -> Error (`Msg msg)) fmt
+
 type error =
   [ Dmarc.Verify.error
   | `Invalid_email
@@ -105,8 +108,8 @@ let requests dns queries =
 let chain dns =
   let rec until_await decoder =
     match Arc.Verify.decode decoder with
-    | `Queries (decoder, set) -> begin
-        match Arc.Verify.queries set with
+    | `Queries (decoder, set) ->
+        begin match Arc.Verify.queries set with
         | Error _ -> `Error (`Invalid_domain_key set)
         | Ok queries ->
             let responses = requests dns queries in
@@ -114,7 +117,7 @@ let chain dns =
             let decoder = Result.get_ok decoder in
             (* NOTE(dinosaure): should be safe. *)
             until_await decoder
-      end
+        end
     | `Malformed msg ->
         Logs.err (fun m -> m "Malformed email: %s" msg);
         `Error `Invalid_email
@@ -123,8 +126,8 @@ let chain dns =
   in
   let rec until_chain decoder =
     match Arc.Verify.decode decoder with
-    | `Queries (decoder, set) -> begin
-        match Arc.Verify.queries set with
+    | `Queries (decoder, set) ->
+        begin match Arc.Verify.queries set with
         | Error _ -> Error (`Invalid_domain_key set)
         | Ok queries ->
             let responses = requests dns queries in
@@ -132,7 +135,7 @@ let chain dns =
             let decoder = Result.get_ok decoder in
             (* NOTE(dinosaure): should be safe. *)
             until_chain decoder
-      end
+        end
     | `Malformed msg ->
         Logs.err (fun m -> m "Malformed email: %s" msg);
         Error `Invalid_email
@@ -275,3 +278,87 @@ let from_bstr ?(len = 0x7ff) bstr =
     end
   and stop = Fun.const () in
   Source { init; pull; stop }
+
+let get_identifier_from_signature unstrctrd =
+  let ( let* ) = Result.bind in
+  let* m = Dkim.of_unstrctrd_to_map unstrctrd in
+  let none = msgf "Missing i field" in
+  let* i = Option.to_result ~none (Dkim.get_key "i" m) in
+  match int_of_string_opt i with
+  | Some i -> Ok i
+  | None -> error_msgf "Invalid ARC signature"
+
+let get_identifier_from_authentication_results =
+  let parser =
+    let open Angstrom in
+    let p = Dmarc.Authentication_results.Decoder.authres_payload in
+    let is_white = function ' ' | '\t' -> true | _ -> false in
+    let is_digit = function '0' .. '9' -> true | _ -> false in
+    let ignore_spaces = skip_while is_white in
+    ignore_spaces
+    *> string "i"
+    *> ignore_spaces
+    *> char '='
+    *> ignore_spaces
+    *> take_while1 is_digit
+    >>= fun uid ->
+    ignore_spaces *> char ';' >>= fun _ ->
+    p >>= fun _ -> return (int_of_string uid)
+  in
+  fun unstrctrd ->
+    let ( let* ) = Result.bind in
+    let v = Unstrctrd.fold_fws unstrctrd in
+    let* v = Unstrctrd.without_comments v in
+    let str = Unstrctrd.to_utf_8_string v in
+    match Angstrom.parse_string ~consume:All parser str with
+    | Ok uid -> Ok uid
+    | Error _ -> error_msgf "Invalid ARC authentication results"
+
+let compare_arc_fields a b =
+  match (a, b) with
+  | (a, _, _, _), (b, _, _, _) when a <> b -> Int.compare a b
+  | (_, `Results, _, _), (_, `Results, _, _) -> 0
+  | (_, `Results, _, _), _ -> -1
+  | (_, `Msgsig, _, _), (_, `Msgsig, _, _) -> 0
+  | (_, `Msgsig, _, _), (_, `Seal, _, _) -> -1
+  | (_, `Seal, _, _), (_, `Seal, _, _) -> 0
+  | _, _ -> 1
+
+let is_arc_seal = Mrmime.Field_name.(equal (v "ARC-Seal"))
+
+let is_arc_message_signature =
+  Mrmime.Field_name.(equal (v "ARC-Message-Signature"))
+
+let is_arc_authentication_results =
+  Mrmime.Field_name.(equal (v "ARC-Authentication-Results"))
+
+let chain_from_headers hdrs =
+  let fn (field_name, unstrctrd) =
+    if is_arc_seal field_name then
+      match get_identifier_from_signature unstrctrd with
+      | Ok uid -> Some (uid, `Seal, field_name, unstrctrd)
+      | Error _ -> None
+    else if is_arc_message_signature field_name then
+      match get_identifier_from_signature unstrctrd with
+      | Ok uid -> Some (uid, `Msgsig, field_name, unstrctrd)
+      | Error _ -> None
+    else if is_arc_authentication_results field_name then
+      match get_identifier_from_authentication_results unstrctrd with
+      | Ok uid -> Some (uid, `Results, field_name, unstrctrd)
+      | Error _ -> None
+    else None
+  in
+  let chain = List.filter_map fn hdrs in
+  let chain = List.sort compare_arc_fields chain in
+  let rec aggregate sets = function
+    | [] -> sets
+    | (u0, `Results, f0, v0)
+      :: (u1, `Msgsig, f1, v1)
+      :: (u2, `Seal, f2, v2)
+      :: rest ->
+        if u0 = u1 && u1 = u2 then
+          aggregate (((f0, v0), (f1, v1), (f2, v2)) :: sets) rest
+        else aggregate sets rest
+    | _ :: rest -> aggregate sets rest
+  in
+  aggregate [] chain

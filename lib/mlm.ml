@@ -34,6 +34,17 @@ let make ~domain name = { name; domain; counter= 0; subscribers= [] }
 let name t = local_to_string t.name
 let domain t = t.domain
 
+let messageID t =
+  let now = Mirage_ptime.now () in
+  let now = Ptime.to_float_s now in
+  let now = Int64.of_float now in
+  let seed = Mirage_crypto_rng.generate 16 in
+  let uuid = Uuidm.v4 (Bytes.of_string seed) in
+  let uuid = Uuidm.to_string uuid in
+  let local = Fmt.str "%Ld.%s" now uuid in
+  let str = Fmt.str "<%s@%s>" local (Colombe.Domain.to_string t.domain) in
+  Mrmime.MessageID.of_string str |> Result.get_ok
+
 let json ~name ~domain =
   let path =
     let dec str =
@@ -128,6 +139,7 @@ let rewrite t ~from bstr =
   let open Mrmime in
   let* hdrs, body = parse bstr in
   let hdrs = Header.remove_assoc Field_name.from hdrs in
+  let hdrs = Header.remove_assoc Field_name.message_id hdrs in
   let from' = make_new_from t ~from in
   let hdrs = Header.add Field_name.from (Field.Mailboxes, [ from' ]) hdrs in
   let hdrs =
@@ -149,12 +161,32 @@ let rewrite t ~from bstr =
     let v = Unstrctrd.of_string str |> Result.get_ok |> snd in
     (Field.Unstructured, (v :> Unstructured.t))
   in
+  let messageID = messageID t in
+  let sender =
+    let mailbox =
+      {
+        Emile.name= None
+      ; local= t.name
+      ; domain= (Colombe_emile.of_domain t.domain, [])
+      }
+    in
+    Mrmime.Field.(Mailbox, mailbox)
+  in
   let hdrs = Header.add (Field_name.v "List-Id") listID hdrs in
+  let hdrs = Header.add (Field_name.v "Sender") sender hdrs in
+  let hdrs =
+    Header.add
+      (Field_name.v "Message-Id")
+      (Mrmime.Field.MessageID, messageID)
+      hdrs
+  in
   (* NOTE(dinosaure): we return a process which reconstruct our email /forever/.
      By this way, we avoid the copy of the body. *)
   let seq =
     Seq.forever @@ fun () ->
-    let hdrs = Prettym.to_stream ~new_line:"\r\n" Header.Encoder.header hdrs in
+    let hdrs =
+      Prettym.to_stream ~margin:998 ~new_line:"\r\n" Header.Encoder.header hdrs
+    in
     let hdrs = Seq.of_dispenser hdrs in
     let hdrs = Seq.append hdrs (Seq.singleton "\r\n") in
     let src = Flux.Source.seq hdrs in

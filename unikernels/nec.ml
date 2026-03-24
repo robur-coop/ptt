@@ -130,12 +130,7 @@ type value = {
 
 let new_line = "\r\n"
 
-let rec length = function
-  | Arc.Verify.Nil _ -> 0
-  | Arc.Verify.Valid { next; _ } -> 1 + length next
-  | Arc.Verify.Broken (_, next) -> 1 + length next
-
-let handler pool ~info:(sinfo, cinfo) client dns resolver flow t =
+let handler pool ~info:(sinfo, cinfo) client _dns resolver flow t =
   Cattery.use pool @@ fun v ->
   let _, (peer, port) = Mnet.TCP.peers flow in
   let ic = Miou.Computation.create () in
@@ -189,18 +184,18 @@ let handler pool ~info:(sinfo, cinfo) client dns resolver flow t =
         in
         let into =
           let open Flux.Sink.Syntax in
-          let+ bstr = save_into v.contents and+ chain = chain dns in
-          (bstr, chain)
+          let+ bstr = save_into v.contents and+ hdrs = headers in
+          (bstr, Result.value ~default:[] hdrs)
         in
         let from = Flux.Source.bqueue q in
         let stream = Flux.Stream.from from in
-        let bstr, chain = Flux.Stream.into into stream in
+        let bstr, hdrs = Flux.Stream.into into stream in
         let result =
-          let* chain = chain in
+          let chain = chain_from_headers hdrs in
           let seal = t.seal and msgsig = t.msgsig and pks = (t.key, None) in
           Logs.debug (fun m ->
-              m "Sign with a new identifier: %d" (succ (length chain)));
-          let into = arc ~seal ~msgsig ~receiver pks chain in
+              m "Sign with a new identifier: %d" (succ (List.length chain)));
+          let into = arc ~seal ~msgsig ~receiver pks (`Unverified chain) in
           let from = from_bstr bstr in
           let stream = Flux.Stream.from from in
           let* set = Flux.Stream.into into stream in

@@ -149,20 +149,20 @@ let rec send_mlm_outgoing ~cfg ~info resolver lst outgoing =
           let errors =
             Facteur.sendmail cfg.client ~info resolver ~from recipients seq
           in
-          if errors <> [] then begin
-            match from with
-            | Some verp_path ->
+          if errors <> [] then
+            begin match from with
+            | Some verp_path -> (
                 let verp_fp = Colombe.Forward_path.Forward_path verp_path in
-                (match
-                   Mlm.incoming ~gen_id lst ~from:None ~rcpt:verp_fp ~mail:""
-                 with
-                 | Ok (lst', bounce_out) ->
-                     ignore
-                       (send_mlm_outgoing ~cfg ~info resolver lst' bounce_out);
-                     lst'
-                 | Error () -> lst)
+                match
+                  Mlm.incoming ~gen_id lst ~from:None ~rcpt:verp_fp ~mail:""
+                with
+                | Ok (lst', bounce_out) ->
+                    ignore
+                      (send_mlm_outgoing ~cfg ~info resolver lst' bounce_out);
+                    lst'
+                | Error () -> lst)
             | None -> lst
-          end
+            end
           else lst
       | [] ->
           Logs.warn (fun m -> m "MLM: no recipients for outgoing email");
@@ -271,9 +271,7 @@ let handler_mx ?(with_arc = false) ~cfg ~info:(sinfo, cinfo) dns destination
             let mail = Bstr.to_string bstr in
             List.iter
               (fun (lst, rcpt_fp) ->
-                match
-                  Mlm.incoming ~gen_id lst ~from ~rcpt:rcpt_fp ~mail
-                with
+                match Mlm.incoming ~gen_id lst ~from ~rcpt:rcpt_fp ~mail with
                 | Ok (lst', outgoing) ->
                     let lst' =
                       send_mlm_outgoing ~cfg ~info:cinfo resolver lst' outgoing
@@ -287,8 +285,8 @@ let handler_mx ?(with_arc = false) ~cfg ~info:(sinfo, cinfo) dns destination
               list_rcpts
           end
         end;
-        if other_rcpts <> [] then begin
-          match (hdrs, dmarc_result) with
+        if other_rcpts <> [] then
+          begin match (hdrs, dmarc_result) with
           | Error err, _ ->
               Logs.err (fun m ->
                   m "Invalid incoming email: %a" Utils.pp_error err)
@@ -313,7 +311,7 @@ let handler_mx ?(with_arc = false) ~cfg ~info:(sinfo, cinfo) dns destination
               ignore
                 (Facteur.sendmail cfg.client ~info:cinfo resolver ~from
                    recipients seq)
-        end
+          end
     | exception Ptt.Recipients_unreachable ->
         Logs.err (fun m -> m "Given recipients are unreachable")
     | exception Handler_failed -> Logs.err (fun m -> m "Relay handler failed")

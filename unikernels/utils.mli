@@ -30,8 +30,9 @@ val arc :
   -> receiver:Emile.domain
   -> ?results:Arc.Sign.user's_results
   -> Arc.key * Arc.key option
-  -> Arc.Verify.chain
+  -> [ `Verified of Arc.Verify.chain | `Unverified of Arc.Sign.user's_chain ]
   -> (string, (Arc.Sign.set, [> error ]) result) Flux.sink
 
 val save_into : Bstr.t -> (string, Bstr.t) Flux.sink
 val from_bstr : ?len:int -> Bstr.t -> string Flux.source
+val chain_from_headers : field list -> Arc.Sign.user's_chain

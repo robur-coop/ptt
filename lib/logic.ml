@@ -197,15 +197,15 @@ module Make (Monad : MONAD) = struct
       else
         let* command = recv ctx Value.Any in
         match command with
-        | `Data -> begin
-            match acc with
+        | `Data ->
+            begin match acc with
             | [] ->
                 let* () = m_properly_close_and_fail ctx "No recipients" in
                 return `Quit
             | acc ->
                 let recipients = List.rev acc in
                 return (`Send { from; recipients; domain_from })
-          end
+            end
         | `Recipient v ->
             (* XXX(dinosaure): the minimum number of recipients that MUST be
              buffered is 100 recipients. *)

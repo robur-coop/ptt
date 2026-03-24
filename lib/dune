@@ -20,4 +20,17 @@
  (name mlm)
  (public_name ptt.mlm)
  (modules mlm)
- (libraries hxd.string hxd.core colombe.emile flux logs mrmime prettym colombe bstr jsont))
+ (libraries
+  mirage-ptime
+  mirage-crypto-rng
+  uuidm
+  hxd.string
+  hxd.core
+  colombe.emile
+  flux
+  logs
+  mrmime
+  prettym
+  colombe
+  bstr
+  jsont))
