@@ -17,12 +17,20 @@
  (libraries mnet-cli ptt ptt.facteur cmdliner))
 
 (library
+ (name mailto)
+ (public_name ptt.mailto)
+ (modules mailto)
+ (libraries fmt emile unstrctrd))
+
+(library
  (name mlm)
  (public_name ptt.mlm)
  (modules mlm)
  (libraries
   mirage-ptime
   mirage-crypto-rng
+  ptt.mailto
+  lru
   uuidm
   hxd.string
   hxd.core

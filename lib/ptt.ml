@@ -217,14 +217,15 @@ module Relay = struct
             | Ok ".." ->
                 Flux.Bqueue.put q ".\r\n";
                 go (size + 3)
-            | Ok "." ->
-                Log.debug (fun m -> m "Receive an email of %d byte(s)" size);
+            | Ok "." -> Flux.Bqueue.close q; Ok ()
+            | Error err ->
+                Log.err (fun m -> m "Unexpected error: %a" pp_error err);
                 Flux.Bqueue.close q;
-                Ok ()
-            | Error _ as err -> Flux.Bqueue.close q; err
+                Error err
             | Ok line ->
+                let len = String.length line in
                 Flux.Bqueue.put q (line ^ "\r\n");
-                go (size + String.length line + 2)
+                go (size + len + 2)
         in
         let relay's_result = go 0 in
         let user's_result = Miou.Computation.await_exn oc in

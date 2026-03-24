@@ -173,7 +173,7 @@ let handler pool ~info:(sinfo, cinfo) client _dns resolver flow t =
            [ARC-Set]s. *)
         assert (Miou.Computation.try_return oc `Ok);
         Logs.debug (fun pd ->
-            pd "receive a new email from:%a" Colombe.Reverse_path.pp
+            pd "Receive a new email from:%a (ARC)" Colombe.Reverse_path.pp
               (fst m.Ptt.from));
         let receiver =
           match sinfo.Ptt.domain with
@@ -225,20 +225,22 @@ let handler pool ~info:(sinfo, cinfo) client _dns resolver flow t =
     | m, DKIM t ->
         assert (Miou.Computation.try_return oc `Ok);
         Logs.debug (fun pd ->
-            pd "receive a new email from:%a" Colombe.Reverse_path.pp
+            pd "Receive a new email from:%a (DKIM)" Colombe.Reverse_path.pp
               (fst m.Ptt.from));
-        let from = Flux.Source.bqueue q in
-        let stream = Flux.Stream.from from in
         let signer = dkim ~key:t.key t.dkim in
         let into =
           let open Flux.Sink.Syntax in
           let+ bstr = save_into v.contents and+ dkim = signer in
           (bstr, dkim)
         in
+        Logs.debug (fun m -> m "Start to sign incoming email");
+        let from = Flux.Source.bqueue q in
+        let stream = Flux.Stream.from from in
         let bstr, dkim = Flux.Stream.into into stream in
+        Logs.debug (fun m -> m "Signer process terminated");
         begin match dkim with
         | Ok dkim ->
-            Logs.debug (fun m -> m "email signed");
+            Logs.debug (fun m -> m "Email signed");
             let bbh = Dkim.signature_and_hash dkim in
             let bbh = (bbh :> string * Dkim.hash_value) in
             let dkim = Dkim.with_signature_and_hash dkim bbh in
@@ -640,10 +642,16 @@ let docs_signer = "Signature configuration"
 let fields =
   let doc = "List of fields to sign." in
   let field = Arg.conv Mrmime.Field_name.(of_string, pp) in
-  let from = Mrmime.Field_name.from in
+  let default =
+    let open Mrmime.Field_name in
+    [
+      v "message-id"; v "list-id"; v "list-post"; v "from"; v "dkim-signature"
+    ; v "mime-version"; v "date"; v "subject"; v "to"; v "sender"
+    ]
+  in
   let open Arg in
   value
-  & opt_all field [ from ]
+  & opt_all field default
   & info [ "f"; "field" ] ~doc ~docs:docs_signer ~docv:"FIELD"
 
 let nsec_per_day = Int64.mul 86_400L 1_000_000_000L

@@ -55,21 +55,24 @@ let dmarc ~ctx dns =
   Flux.Sink { init; push; full; stop }
 
 let dkim ~key v =
-  let init = Fun.const (`Await (Dkim.Sign.signer ~key v))
+  let init () = `Await (Dkim.Sign.signer ~key v)
   and push state str =
     match state with
     | `Await signer when String.length str > 0 ->
+        Logs.debug (fun m -> m "Sign +%d byte(s)" (String.length str));
         let signer = Dkim.Sign.fill signer str 0 (String.length str) in
         Dkim.Sign.sign signer
     | `Await _ | `Malformed _ | `Signature _ -> state
-  and full = function
-    | `Await _ -> false
-    | `Malformed _ | `Signature _ -> true
-  in
+  and full = Fun.const false in
   let rec stop = function
-    | `Malformed _ -> Error `Invalid_email
-    | `Signature v -> Ok v
+    | `Malformed _ ->
+        Logs.err (fun m -> m "Invalid email according to our signer");
+        Error `Invalid_email
+    | `Signature v ->
+        Logs.debug (fun m -> m "Signer terminated properly");
+        Ok v
     | `Await signer ->
+        Logs.debug (fun m -> m "Stop signing");
         let signer = Dkim.Sign.fill signer String.empty 0 0 in
         stop (Dkim.Sign.sign signer)
   in
