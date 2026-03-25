@@ -279,14 +279,15 @@ let rec clean_up orphans =
       let _ = Miou.await prm in
       clean_up orphans
 
-let verify_and_update tcp dns primary dkim dk =
+let verify_and_update tcp dns primary dkim ~with_version dk =
   Logs.debug (fun m ->
       m "Verify & update with %a => %S" Domain_name.pp (Dkim.selector dkim)
-        (Dkim.domain_key_to_string dk));
+        (Dkim.domain_key_to_string ~with_version dk));
   let* set = Dks.verify dns dkim dk in
   match (set, primary) with
   | true, _ -> Ok ()
-  | false, Some (server, dns_key) -> Dks.update tcp server dns_key dkim dk
+  | false, Some (server, dns_key) ->
+      Dks.update tcp server dns_key dkim ~with_version dk
   | false, None ->
       assert false (* NOTE(dinosaure): see [setup_post_settings]. *)
 
@@ -467,7 +468,8 @@ let rec renew tcp dns primary ~expiration:span ~self t =
             Ok (msgsig', Some seal')
       in
       let dk' = Dkim.domain_key_of_dkim ~key:key' dkim' in
-      let* () = verify_and_update tcp dns primary dkim' dk' in
+      let with_version = match t with DKIM _ -> true | ARC _ -> false in
+      let* () = verify_and_update tcp dns primary dkim' ~with_version dk' in
       begin match t with
       | ARC t ->
           t.seal <- Option.get seal';
@@ -537,8 +539,9 @@ let run _ (cidrv4, gateway, ipv6) info nameservers destination cfg primary
   let* () =
     let dkim = match t with ARC t -> t.msgsig | DKIM t -> t.dkim in
     let dk = match t with ARC t -> t.domain_key | DKIM t -> t.domain_key in
+    let with_version = match t with ARC _ -> false | DKIM _ -> true in
     match (verify, update) with
-    | true, true -> verify_and_update tcp dns primary dkim dk
+    | true, true -> verify_and_update tcp dns primary dkim ~with_version dk
     | true, false -> only_verify dns dkim dk
     | false, false -> Ok ()
     | false, true ->

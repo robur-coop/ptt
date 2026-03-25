@@ -23,6 +23,7 @@ val update :
   -> Ipaddr.t * int
   -> _ Domain_name.t * Dns.Dnskey.t
   -> 'a Dkim.t
+  -> with_version:bool
   -> Dkim.domain_key
   -> (unit, [> error ]) result
 

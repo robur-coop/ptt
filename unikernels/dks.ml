@@ -107,7 +107,7 @@ let domain_keys tcp dns_server (dns_key_name, dns_key) domain_name =
 
 let _update = ( = ) "_update"
 
-let update tcp dns_server (dns_key_name, dns_key) dkim dk =
+let update tcp dns_server (dns_key_name, dns_key) dkim ~with_version dk =
   let* zone =
     match Domain_name.find_label dns_key_name _update with
     | None -> error_msgf "The given DNS key does not update a zone"
@@ -125,7 +125,9 @@ let update tcp dns_server (dns_key_name, dns_key) dkim dk =
   let* selector = Dkim.domain_name dkim in
   let flow = Mnet.TCP.connect tcp dns_server in
   let@ () = fun () -> Mnet.TCP.close flow in
-  let txts = Dns.Rr_map.Txt_set.singleton (Dkim.domain_key_to_string dk) in
+  let txts =
+    Dns.Rr_map.Txt_set.singleton (Dkim.domain_key_to_string ~with_version dk)
+  in
   let value = Dns.Packet.Update.Add Dns.Rr_map.(B (Txt, (3600l, txts))) in
   let value = Domain_name.Map.(empty, singleton selector [ value ]) in
   let flags = Dns.Packet.Flags.empty in
@@ -142,7 +144,8 @@ let update tcp dns_server (dns_key_name, dns_key) dkim dk =
   Bytes.set_uint16_be len 0 (String.length data);
   let len = Bytes.unsafe_to_string len in
   Log.debug (fun m ->
-      m "Add %a:%S" Domain_name.pp selector (Dkim.domain_key_to_string dk));
+      m "Add %a:%S" Domain_name.pp selector
+        (Dkim.domain_key_to_string ~with_version dk));
   Mnet.TCP.write flow len;
   Mnet.TCP.write flow data;
   let len = Bytes.create 2 in

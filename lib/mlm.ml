@@ -14,7 +14,7 @@ let local_of_string str =
     Angstrom.parse_string ~consume:All Colombe.Path.Decoder.local_part str
   in
   match result with
-  | Ok local -> Ok (Colombe_emile.of_local local)
+  | Ok local -> Ok local
   | Error _ -> error_msgf "Invalid local-part (according RFC 5321): %S" str
 
 module Key = struct
@@ -24,7 +24,7 @@ module Key = struct
 end
 
 module Value = struct
-  type t = { to_expire: int }
+  type t = { expire_at: Ptime.t }
 
   let weight _ = 1
 end
@@ -38,11 +38,32 @@ type t = {
   ; subscribers: Colombe.Path.t list
   ; moderators: Colombe.Path.t list
   ; pending: Cache.t
+  ; store: t -> unit
 }
 
 let to_emile t =
   let domain = Colombe_emile.of_domain t.domain in
   { Emile.name= None; local= t.name; domain= (domain, []) }
+
+(* Variable Envelope Return Path
+
+   NOTE(dinosaure): RFC5322 accepts '=' into the domain-part but RFC5321 disallows it.
+   so it safe to use '=' as a separator instead of '@' and reconstruct, at least, the
+   right part (the domain) safely. *)
+let encode_verp { Colombe.Path.local; domain; _ } =
+  let open Colombe in
+  Fmt.str "%s=%s" (Path.Encoder.local_to_string local) (Domain.to_string domain)
+
+let decode_verp str =
+  match List.rev (String.split_on_char '=' str) with
+  | domain :: rlocal ->
+      let local = List.rev rlocal in
+      let local = String.concat "=" local in
+      let* domain = Colombe.Domain.of_string domain in
+      let* local = local_of_string local in
+      Ok { Colombe.Path.local; domain; rest= [] }
+  | _ -> assert false
+(* NOTE(dinosaure): impossible case, [String.split_on_char] returns always a non-empty list. *)
 
 type outgoing = {
     sender: Colombe.Reverse_path.t
@@ -58,10 +79,18 @@ let make ~domain name =
   ; subscribers= []
   ; moderators= []
   ; pending= Cache.create 0x7ff
+  ; store= ignore
   }
 
 let name t = local_to_string t.name
 let domain t = t.domain
+
+let is_moderator ~from t =
+  match from with
+  | None -> false
+  | Some path ->
+      let fn = Colombe.Path.equal path in
+      List.exists fn t.moderators
 
 let messageID t =
   let now = Mirage_ptime.now () in
@@ -74,7 +103,7 @@ let messageID t =
   let str = Fmt.str "<%s@%s>" local (Colombe.Domain.to_string t.domain) in
   Mrmime.MessageID.of_string str |> Result.get_ok
 
-let json ~name ~domain =
+let json ?(store = ignore) ~domain name =
   let path =
     let dec str =
       match Colombe.Path.of_string (Fmt.str "<%s>" str) with
@@ -91,7 +120,7 @@ let json ~name ~domain =
   let open Jsont.Object in
   map (fun counter subscribers moderators ->
       let pending = Cache.create 0x7ff in
-      { name; domain; counter; subscribers; moderators; pending })
+      { name; domain; counter; subscribers; moderators; pending; store })
   |> mem "counter" ~enc:(fun t -> t.counter) Jsont.int
   |> mem "subscribers" ~enc:(fun t -> t.subscribers) (Jsont.list path)
   |> mem "moderators" ~enc:(fun t -> t.moderators) (Jsont.list path)
@@ -141,11 +170,16 @@ let parse bstr =
 let make_new_from t ~from =
   let open Mrmime.Mailbox in
   let name =
-    Fmt.str "%a via %a" Colombe.Reverse_path.pp from Emile.pp_local t.name
+    match from with
+    | None -> None
+    | Some path ->
+        let str =
+          Fmt.str "%s via %a" (encode_verp path) Emile.pp_local t.name
+        in
+        Some Phrase.(v [ e ~encoding:q str ])
   in
-  let name = Phrase.(v [ e ~encoding:q name ]) in
   let domain = Colombe_emile.of_domain t.domain in
-  make ~name t.name domain
+  make ?name t.name domain
 
 let from_bstr ?(len = 0x7ff) bstr =
   let open Flux in
@@ -250,11 +284,6 @@ let is_loop t bstr =
   let fn str = String.equal str our_listID in
   Ok (List.exists fn fields)
 
-(* Variable Envelope Return Path *)
-let encode_verp { Colombe.Path.local; domain; _ } =
-  let open Colombe in
-  Fmt.str "%s=%s" (Path.Encoder.local_to_string local) (Domain.to_string domain)
-
 let forward t ~from bstr =
   let* seq = rewrite t ~from bstr in
   let fn subscriber =
@@ -273,7 +302,16 @@ let forward t ~from bstr =
 
 let forward t ~from bstr =
   let* is_loop = is_loop t bstr in
-  if is_loop then Ok (t, [], []) else forward t ~from bstr
+  let is_subscriber =
+    match from with
+    | None -> false
+    | Some path ->
+        let fn = Colombe.Path.equal path in
+        List.exists fn t.subscribers
+  in
+  if (not is_loop) && is_subscriber then forward t ~from bstr else Ok (t, [], [])
+
+let _10d = Ptime.Span.of_int_s 864000
 
 let subscribe t ~from =
   let already_subscriber =
@@ -281,7 +319,10 @@ let subscribe t ~from =
     | None -> true
     | Some path -> List.exists (Colombe.Path.equal path) t.subscribers
   in
-  if already_subscriber then Ok (t, [], [])
+  let already_pending =
+    match from with None -> true | Some path -> Cache.mem path t.pending
+  in
+  if already_subscriber || already_pending then Ok (t, [], [])
   else
     let open Mrmime in
     let sender = Field.Field (Field_name.sender, Mailbox, to_emile t) in
@@ -324,7 +365,10 @@ let subscribe t ~from =
     in
     let to_accept =
       let from = Option.get from in
-      let local = Fmt.str "subscribe-accept-%s" (encode_verp from) in
+      let local =
+        Fmt.str "%s-subscribe-accept-%s" (local_to_string t.name)
+          (encode_verp from)
+      in
       let local = String.split_on_char '.' local in
       let local = `Dot_string local in
       let path = { Colombe.Path.local; domain= t.domain; rest= [] } in
@@ -332,7 +376,10 @@ let subscribe t ~from =
     in
     let to_reject =
       let from = Option.get from in
-      let local = Fmt.str "subscribe-reject-%s" (encode_verp from) in
+      let local =
+        Fmt.str "%s-subscribe-reject-%s" (local_to_string t.name)
+          (encode_verp from)
+      in
       let local = String.split_on_char '.' local in
       let local = `Dot_string local in
       let path = { Colombe.Path.local; domain= t.domain; rest= [] } in
@@ -372,6 +419,15 @@ let subscribe t ~from =
       { sender= Some sender; recipients; seq }
     in
     let ms = List.map fn t.moderators in
+    let fn from =
+      let now = Mirage_ptime.now () in
+      let expire_at = Ptime.add_span now _10d in
+      let expire_at = Option.get expire_at in
+      (* NOTE(dinosaure): [Option.get] should be safe. *)
+      Cache.add from { Value.expire_at } t.pending;
+      Cache.trim t.pending
+    in
+    Option.iter fn from;
     Ok (t, [], ms)
 
 (*
@@ -445,13 +501,49 @@ let match_mailing_list t parts =
 
 type error = [ `Msg of string ]
 
+let rec clean_up t =
+  let than = Mirage_ptime.now () in
+  match Cache.lru t.pending with
+  | Some (k, { expire_at }) when Ptime.is_earlier expire_at ~than ->
+      Log.debug (fun m ->
+          m "Remove %a from pending subscription, (too old)" Colombe.Path.pp k);
+      Cache.remove k t.pending;
+      clean_up t
+  | _ -> ()
+
 let incoming t ~from ~rcpt:{ Colombe.Path.local; _ } bstr =
+  clean_up t;
   let local = Colombe.Path.Encoder.local_to_string local in
   let parts = String.split_on_char '-' local in
   let* rem = match_mailing_list t parts in
   begin match rem with
   | [] -> forward t ~from bstr
   | [ "subscribe" ] -> subscribe t ~from
+  | "subscribe" :: "accept" :: rem ->
+      let verp = String.concat "-" rem in
+      let* new_subscriber = decode_verp verp in
+      if is_moderator ~from t then begin
+        Cache.remove new_subscriber t.pending;
+        Log.debug (fun m ->
+            m "New subscriber for %a: %a" Emile.pp_mailbox (to_emile t)
+              Colombe.Path.pp new_subscriber);
+        let t = { t with subscribers= new_subscriber :: t.subscribers } in
+        t.store t;
+        Ok (t, [], [])
+      end
+      else
+        error_msgf "%a is not authorized as a moderator for %a"
+          Colombe.Reverse_path.pp from Emile.pp_mailbox (to_emile t)
+  | "subscribe" :: "reject" :: rem ->
+      let verp = String.concat "-" rem in
+      let* new_subscriber = decode_verp verp in
+      if is_moderator ~from t then begin
+        Cache.remove new_subscriber t.pending;
+        Ok (t, [], [])
+      end
+      else
+        error_msgf "%a is not authorized as a moderator for %a"
+          Colombe.Reverse_path.pp from Emile.pp_mailbox (to_emile t)
   (*
   | [ "subscribe" ] -> subscribe t from
   | "subscribe" :: "reject" :: rem -> reject t from (String.concat "-" rem)
@@ -461,5 +553,7 @@ let incoming t ~from ~rcpt:{ Colombe.Path.local; _ } bstr =
   | "moderate" :: "accept" :: rem -> accept t from (String.concat "-" rem)
   | "moderate" :: "reject" :: rem -> disallow t flow (String.concat "-" rem)
   *)
-  | _ -> Ok (t, [], [])
+  | _ ->
+      Log.warn (fun m -> m "Ignoring email to %a" Colombe.Reverse_path.pp from);
+      Ok (t, [], [])
   end

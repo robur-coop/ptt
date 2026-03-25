@@ -25,12 +25,21 @@ type t = {
 *)
 
 val local_to_string : Emile.local -> string
-val local_of_string : string -> (Emile.local, [> `Msg of string ]) result
+
+val local_of_string :
+     string
+  -> ( [ `Dot_string of string list | `String of string ]
+     , [> `Msg of string ] )
+     result
 
 type t
 
 val make : domain:Colombe.Domain.t -> Emile.local -> t
-val json : name:Emile.local -> domain:Colombe.Domain.t -> t Jsont.t
+val to_emile : t -> Emile.mailbox
+
+val json :
+  ?store:(t -> unit) -> domain:Colombe.Domain.t -> Emile.local -> t Jsont.t
+
 val name : t -> string
 val domain : t -> Colombe.Domain.t
 

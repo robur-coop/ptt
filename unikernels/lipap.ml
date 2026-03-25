@@ -371,8 +371,24 @@ let lists ~info fs =
         let name = Filename.chop_extension filepath in
         let result =
           let* name = Mlm.local_of_string name in
-          let jsont = Mlm.json ~name ~domain:info.Ptt.domain in
+          let name = Colombe_emile.of_local name in
           let* contents = Fat.read fs ("lists" / filepath) in
+          let rec jsont = lazy (Mlm.json ~store ~domain:info.Ptt.domain name)
+          and store t =
+            let str = Jsont_bytesrw.encode_string (Lazy.force jsont) t in
+            let str = Result.get_ok str in
+            let process () =
+              let* () = Fat.remove fs ("lists" / filepath) in
+              Fat.write fs ("lists" / filepath) str
+            in
+            match process () with
+            | Ok () -> ()
+            | Error (`Msg msg) ->
+                Logs.err (fun m ->
+                    m "Error during saving a new state for %a: %s"
+                      Emile.pp_mailbox (Mlm.to_emile t) msg)
+          in
+          let jsont = Lazy.force jsont in
           Jsont_bytesrw.decode_string jsont contents |> Result.map_error msg
         in
         begin match result with
