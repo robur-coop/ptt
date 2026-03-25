@@ -152,6 +152,11 @@ let many t ~info resolver ~destination:domain txs seq =
       m "Try to send %d email(s) to %d Mail-eXchange server(s)"
         (List.length txs) (Mxs.cardinal mxs));
   let mxs = Mxs.bindings mxs in
+  let fn stream =
+    let fn str = (str, 0, String.length str) in
+    Flux.Stream.map fn stream
+  in
+  let seq = Seq.map fn seq in
   let rec go mxs =
     match mxs with
     | [] -> assert false
@@ -161,16 +166,9 @@ let many t ~info resolver ~destination:domain txs seq =
               Fmt.(list ~sep:(any ",") Ipaddr.pp)
               ipaddrs);
         let dst = `Ips ipaddrs in
-        let streams = Seq.take (List.length txs) seq |> List.of_seq in
-        let fn (from, rcpts) stream =
-          let fn str = (str, 0, String.length str) in
-          let stream = Flux.Stream.map fn stream in
-          (from, rcpts, stream)
-        in
-        let txs = List.map2 fn txs streams in
         let* results =
           Msendmail.many ~encoder ~decoder ~queue t.he ~destination:dst
-            ~domain:info.domain ?cfg:info.tls txs
+            ~domain:info.domain ?cfg:info.tls txs seq
         in
         let fn = Result.map_error (fun err -> (err :> error)) in
         Ok (List.map fn results)
@@ -180,16 +178,9 @@ let many t ~info resolver ~destination:domain txs seq =
               Fmt.(list ~sep:(any ",") Ipaddr.pp)
               ipaddrs);
         let dst = `Ips ipaddrs in
-        let streams = Seq.take (List.length txs) seq |> List.of_seq in
-        let fn (from, rcpts) stream =
-          let fn str = (str, 0, String.length str) in
-          let stream = Flux.Stream.map fn stream in
-          (from, rcpts, stream)
-        in
-        let txs = List.map2 fn txs streams in
         let result =
           Msendmail.many ~encoder ~decoder ~queue t.he ~destination:dst
-            ~domain:info.domain ?cfg:info.tls txs
+            ~domain:info.domain ?cfg:info.tls txs seq
         in
         match result with
         | Ok results ->
