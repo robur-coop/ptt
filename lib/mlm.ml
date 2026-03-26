@@ -1,10 +1,10 @@
-let src = Logs.Src.create "mlm"
+let msgf fmt = Fmt.kstr (fun msg -> `Msg msg) fmt
 let error_msgf fmt = Fmt.kstr (fun msg -> Error (`Msg msg)) fmt
 let ( let* ) = Result.bind
+let src = Logs.Src.create "mlm"
 
 module Log = (val Logs.src_log src : Logs.LOG)
 
-(* Follow RFC 5321 *)
 let local_to_string local =
   let local = Colombe_emile.to_local local in
   Colombe.Path.Encoder.local_to_string local
@@ -17,27 +17,63 @@ let local_of_string str =
   | Ok local -> Ok local
   | Error _ -> error_msgf "Invalid local-part (according RFC 5321): %S" str
 
-module Key = struct
-  include Colombe.Path
+module Pending_subscriptions = struct
+  module Key = struct
+    include Colombe.Path
 
-  let hash = Hashtbl.hash
+    let hash = Hashtbl.hash
+  end
+
+  module Value = struct
+    type t = { expire_at: Ptime.t }
+
+    let weight _ = 1
+  end
+
+  include Lru.M.Make (Key) (Value)
 end
 
-module Value = struct
-  type t = { expire_at: Ptime.t }
+(* bounces/undeliverable mails
+  - connection to remote MX failed / MX complained about mailbox full or user does not exist
+    --> add the failing subscriber to our list of failures
+  - successfully delivered the mail, and the remote MX forwards it to some other mail server
+    -> that can now as well fail, but our connection is already closed
+    -> the MX that failed to forward it, will send back an automated reply to ptt-bounce-12-reyn.or=data.coop@mailingl.st
 
-  let weight _ = 1
-end
+  what to do with failures?
+    usually, we accept up to 3 failures in a row.
+    if mail 1 couldn't be delivered by any means to hannes@mehnert.org, that's fine. but we remember that.
+    if mail 2 ..
+    if mail 3 as well failed to deliver, we unsubscribe hannes@mehnert.org
 
-module Cache = Lru.M.Make (Key) (Value)
+    if mail 2 actually succeeds (or mail 3), we remove all hannes@mehnert.org from the list of bounces
 
+
+  simply unsubscribe if there's a failure <- that's the alternative, much easier
+
+  we send an email to reynir@data.coop with ptt-14-reynir=data@coop@mailingl.st
+  -> we fail
+  -> we add reynir@data.coop, failed: 14 into our bounces list
+  -> we receive an email with RCPT-TO:<ptt-return-14-reynir=data.coop@mailingl.st
+  -> we add reynir@data.coop with attempts +  1 to our bounces
+
+  -> our bounce list grows with our failures when we would like to send emails
+     + also grows when we receive email such as ptt-return-*-forward-path@mailingl.st
+
+     --> whenever the bounce list grows, we check whether it is now above 5
+        -> then we unsubscribe, and empty the bounce list for that subscriber
+
+      --> whenever we successfully deliver a mail, we empty the bounce list
+
+ *)
 type t = {
     name: Emile.local
   ; domain: Colombe.Domain.t
   ; counter: int
   ; subscribers: Colombe.Path.t list
   ; moderators: Colombe.Path.t list
-  ; pending: Cache.t
+  ; pending: Pending_subscriptions.t
+  ; bounces: (Colombe.Path.t, int list) Hashtbl.t
   ; store: t -> unit
 }
 
@@ -78,7 +114,8 @@ let make ~domain name =
   ; counter= 0
   ; subscribers= []
   ; moderators= []
-  ; pending= Cache.create 0x7ff
+  ; pending= Pending_subscriptions.create 0x7ff
+  ; bounces= Hashtbl.create 0x7ff
   ; store= ignore
   }
 
@@ -92,11 +129,15 @@ let is_moderator ~from t =
       let fn = Colombe.Path.equal path in
       List.exists fn t.moderators
 
-let messageID t =
+let is_subscriber t path =
+  let fn = Colombe.Path.equal path in
+  List.exists fn t.subscribers
+
+let messageID ?g t =
   let now = Mirage_ptime.now () in
   let now = Ptime.to_float_s now in
   let now = Int64.of_float now in
-  let seed = Mirage_crypto_rng.generate 16 in
+  let seed = Mirage_crypto_rng.generate ?g 16 in
   let uuid = Uuidm.v4 (Bytes.of_string seed) in
   let uuid = Uuidm.to_string uuid in
   let local = Fmt.str "%Ld.%s" now uuid in
@@ -119,8 +160,18 @@ let json ?(store = ignore) ~domain name =
   in
   let open Jsont.Object in
   map (fun counter subscribers moderators ->
-      let pending = Cache.create 0x7ff in
-      { name; domain; counter; subscribers; moderators; pending; store })
+      let pending = Pending_subscriptions.create 0x7ff in
+      let bounces (* TODO *) = Hashtbl.create 0x7ff in
+      {
+        name
+      ; domain
+      ; counter
+      ; subscribers
+      ; moderators
+      ; pending
+      ; bounces
+      ; store
+      })
   |> mem "counter" ~enc:(fun t -> t.counter) Jsont.int
   |> mem "subscribers" ~enc:(fun t -> t.subscribers) (Jsont.list path)
   |> mem "moderators" ~enc:(fun t -> t.moderators) (Jsont.list path)
@@ -173,9 +224,8 @@ let make_new_from t ~from =
     match from with
     | None -> None
     | Some path ->
-        let str =
-          Fmt.str "%s via %a" (encode_verp path) Emile.pp_local t.name
-        in
+        let verp = encode_verp path in
+        let str = Fmt.str "%s via %a" verp Emile.pp_local t.name in
         Some Phrase.(v [ e ~encoding:q str ])
   in
   let domain = Colombe_emile.of_domain t.domain in
@@ -203,9 +253,8 @@ let to_unstrctrd unstructured =
 
 let rewrite t ~from bstr =
   let open Mrmime in
-  let* hdrs, body = parse bstr in
+  let* hdrs, (body : Bstr.t) = parse bstr in
   let hdrs = Header.remove_assoc Field_name.from hdrs in
-  let hdrs = Header.remove_assoc Field_name.message_id hdrs in
   let from' = make_new_from t ~from in
   let hdrs = Header.add Field_name.from (Field.Mailboxes, [ from' ]) hdrs in
   let hdrs =
@@ -227,19 +276,23 @@ let rewrite t ~from bstr =
     let v = Unstrctrd.of_string str |> Result.get_ok |> snd in
     (Field.Unstructured, (v :> Unstructured.t))
   in
-  let messageID = messageID t in
   let listPost = Mailto.make [ to_emile t ] in
   let listPost = Mailto.to_unstrctrd listPost in
   let listPost = Mrmime.Field.(Unstructured, (listPost :> Unstructured.t)) in
+  (* Sender required by Outlook. *)
   let sender = Mrmime.Field.(Mailbox, to_emile t) in
   let hdrs = Header.add (Field_name.v "List-Id") listID hdrs in
   let hdrs = Header.add (Field_name.v "Sender") sender hdrs in
   let hdrs = Header.add (Field_name.v "List-Post") listPost hdrs in
   let hdrs =
-    Header.add
-      (Field_name.v "Message-Id")
-      (Mrmime.Field.MessageID, messageID)
-      hdrs
+    (* NOTE(dinosaure): add Message-ID iff it does not exist. *)
+    if Header.exists Field_name.message_id hdrs then hdrs
+    else
+      let messageID = messageID t in
+      Header.add
+        (Field_name.v "Message-Id")
+        (Mrmime.Field.MessageID, messageID)
+        hdrs
   in
   (* NOTE(dinosaure): we return a process which reconstruct our email /forever/.
      By this way, we avoid the copy of the body. *)
@@ -298,16 +351,16 @@ let forward t ~from bstr =
     { sender= Some sender; recipients; seq }
   in
   let ms = List.map fn t.subscribers in
-  Ok ({ t with counter= t.counter + 1 }, ms, [])
+  let t = { t with counter= t.counter + 1 } in
+  (* NOTE(dinosaure): save our new counter into our filesystem *)
+  t.store t;
+  Ok (t, ms, [])
 
 let forward t ~from bstr =
   let* is_loop = is_loop t bstr in
   let is_subscriber =
-    match from with
-    | None -> false
-    | Some path ->
-        let fn = Colombe.Path.equal path in
-        List.exists fn t.subscribers
+    let some = is_subscriber t in
+    Option.fold ~none:false ~some from
   in
   if (not is_loop) && is_subscriber then forward t ~from bstr else Ok (t, [], [])
 
@@ -315,16 +368,17 @@ let _10d = Ptime.Span.of_int_s 864000
 
 let subscribe t ~from =
   let already_subscriber =
-    match from with
-    | None -> true
-    | Some path -> List.exists (Colombe.Path.equal path) t.subscribers
+    let some = is_subscriber t in
+    Option.fold ~none:true ~some from
   in
   let already_pending =
-    match from with None -> true | Some path -> Cache.mem path t.pending
+    let some p = Pending_subscriptions.mem p t.pending in
+    Option.fold ~none:true ~some from
   in
   if already_subscriber || already_pending then Ok (t, [], [])
   else
     let open Mrmime in
+    (* NOTE(dinosaure): let's craft a new email! *)
     let sender = Field.Field (Field_name.sender, Mailbox, to_emile t) in
     let subject =
       let open Unstructured.Craft in
@@ -424,63 +478,11 @@ let subscribe t ~from =
       let expire_at = Ptime.add_span now _10d in
       let expire_at = Option.get expire_at in
       (* NOTE(dinosaure): [Option.get] should be safe. *)
-      Cache.add from { Value.expire_at } t.pending;
-      Cache.trim t.pending
+      Pending_subscriptions.add from { expire_at } t.pending;
+      Pending_subscriptions.trim t.pending
     in
     Option.iter fn from;
     Ok (t, [], ms)
-
-(*
-let bounce t rcpt =
-  match String.index_opt rcpt '-' with
-  | None ->
-      Log.warn (fun m -> m "Invalid VERP bounce: %s" rcpt);
-      (t, [])
-  | Some i -> (
-      let counter_str = String.sub rcpt 0 i in
-      let encoded = String.sub rcpt (i + 1) (String.length rcpt - i - 1) in
-      match int_of_string_opt counter_str with
-      | None ->
-          Log.warn (fun m -> m "Invalid bounce counter: %s" counter_str);
-          (t, [])
-      | Some counter -> (
-          let email_str =
-            String.concat "@" (String.split_on_char '=' encoded)
-          in
-          match path_of_string email_str with
-          | None ->
-              Log.warn (fun m -> m "Invalid VERP email: %s" email_str);
-              (t, [])
-          | Some path ->
-              if not (path_mem path t.subscribers) then (t, [])
-              else
-                let prev =
-                  List.find_opt (fun (_, _, e) -> e = path) t.bounces
-                in
-                let prev_counter, prev_score =
-                  match prev with Some (c, s, _) -> (c, s) | None -> (-1, 0)
-                in
-                let score =
-                  if prev_counter = -1 || prev_counter = counter - 1 then
-                    prev_score + 1
-                  else 1
-                in
-                let bounces_clean =
-                  List.filter (fun (_, _, e) -> not (e = path)) t.bounces
-                in
-                if score >= 5 then begin
-                  Log.info (fun m ->
-                      m "Removing %s from %s (too many bounces)"
-                        (path_to_string path) t.name);
-                  let subscribers =
-                    List.filter (fun p -> not (p = path)) t.subscribers
-                  in
-                  ({ t with subscribers; bounces= bounces_clean }, [])
-                end
-                else
-                  ( { t with bounces= (counter, score, path) :: bounces_clean }
-                  , [] )))
-*)
 
 let match_mailing_list t parts =
   let name =
@@ -503,13 +505,41 @@ type error = [ `Msg of string ]
 
 let rec clean_up t =
   let than = Mirage_ptime.now () in
-  match Cache.lru t.pending with
+  match Pending_subscriptions.lru t.pending with
   | Some (k, { expire_at }) when Ptime.is_earlier expire_at ~than ->
       Log.debug (fun m ->
           m "Remove %a from pending subscription, (too old)" Colombe.Path.pp k);
-      Cache.remove k t.pending;
+      Pending_subscriptions.remove k t.pending;
       clean_up t
   | _ -> ()
+
+let failure_for t ~from forward_path =
+  let counter = function
+    | _name :: "return" :: counter :: _ ->
+        let none = msgf "Invalid counter" in
+        Option.to_result ~none (int_of_string_opt counter)
+    | _ -> error_msgf "Invalid return-path email address"
+  in
+  match from with
+  | None -> Ok ()
+  | Some { Colombe.Path.local; _ } ->
+      let local = Colombe.Path.Encoder.local_to_string local in
+      let parts = String.split_on_char '-' local in
+      let* counter = counter parts in
+      begin match Hashtbl.find_opt t.bounces forward_path with
+      | Some attempts when List.length attempts < 3 ->
+          let attempts = List.sort_uniq Int.compare (counter :: attempts) in
+          Hashtbl.replace t.bounces forward_path attempts;
+          Ok ()
+      | Some _ ->
+          Log.debug (fun m ->
+              m "Too many failures for %a, remove it as a subscriber for %a"
+                Colombe.Path.pp forward_path Emile.pp_mailbox (to_emile t));
+          Ok ()
+      | None ->
+          Hashtbl.add t.bounces forward_path [ counter ];
+          Ok ()
+      end
 
 let incoming t ~from ~rcpt:{ Colombe.Path.local; _ } bstr =
   clean_up t;
@@ -523,7 +553,7 @@ let incoming t ~from ~rcpt:{ Colombe.Path.local; _ } bstr =
       let verp = String.concat "-" rem in
       let* new_subscriber = decode_verp verp in
       if is_moderator ~from t then begin
-        Cache.remove new_subscriber t.pending;
+        Pending_subscriptions.remove new_subscriber t.pending;
         Log.debug (fun m ->
             m "New subscriber for %a: %a" Emile.pp_mailbox (to_emile t)
               Colombe.Path.pp new_subscriber);
@@ -538,12 +568,35 @@ let incoming t ~from ~rcpt:{ Colombe.Path.local; _ } bstr =
       let verp = String.concat "-" rem in
       let* new_subscriber = decode_verp verp in
       if is_moderator ~from t then begin
-        Cache.remove new_subscriber t.pending;
+        Pending_subscriptions.remove new_subscriber t.pending;
         Ok (t, [], [])
       end
       else
         error_msgf "%a is not authorized as a moderator for %a"
           Colombe.Reverse_path.pp from Emile.pp_mailbox (to_emile t)
+  | "return" :: counter :: rem ->
+      let verp = String.concat "-" rem in
+      let* forward_path = decode_verp verp in
+      let* counter =
+        let none = msgf "Invalid counter" in
+        Option.to_result ~none (int_of_string_opt counter)
+      in
+      if is_subscriber t forward_path then begin
+        Log.debug (fun m ->
+            m "Received a failure for %a" Colombe.Path.pp forward_path);
+        begin match Hashtbl.find_opt t.bounces forward_path with
+        | Some attempts when List.length attempts < 3 ->
+            let attempts = List.sort_uniq Int.compare (counter :: attempts) in
+            Hashtbl.replace t.bounces forward_path attempts
+        | Some _ ->
+            Log.debug (fun m ->
+                m "Too many failures for %a, remove it as a subscriber for %a"
+                  Colombe.Path.pp forward_path Emile.pp_mailbox (to_emile t))
+        | None -> Hashtbl.add t.bounces forward_path [ counter ]
+        end;
+        Ok (t, [], [])
+      end
+      else Ok (t, [], [])
   (*
   | [ "subscribe" ] -> subscribe t from
   | "subscribe" :: "reject" :: rem -> reject t from (String.concat "-" rem)

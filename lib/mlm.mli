@@ -49,28 +49,13 @@ type outgoing = {
   ; seq: string Flux.stream Seq.t
 }
 
-(*
-val who_to_string : who -> string
-val who_of_string : string -> (who, [> `Msg of string ]) result
-
-val make :
-     ?subscription_moderated:bool
-  -> ?moderated:bool
-  -> ?who_can_post:who
-  -> ?who_is_moderated:who
-  -> ?footer:string
-  -> name:string
-  -> domain:Colombe.Domain.t
-  -> moderators:Colombe.Path.t list
-  -> unit
-  -> t
-
-val path_to_string : Colombe.Path.t -> string
-val path_of_string : string -> Colombe.Path.t option
-val is_loop : t -> Bstr.t -> bool
-*)
-
 type error = [ `Msg of string ]
+
+val failure_for :
+     t
+  -> from:Colombe.Reverse_path.t
+  -> Colombe.Path.t
+  -> (unit, [> `Msg of string ]) result
 
 val incoming :
      t

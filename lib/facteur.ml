@@ -129,17 +129,14 @@ let destination_of_domain = function
 
 let many t ~info resolver ~destination:domain txs seq =
   if txs = [] then invalid_arg "Facteur.many: txs must not be empty";
-  let check_domain (_from, rcpts) =
-    let fn rcpt =
-      match domain_of_forward_path rcpt with
-      | Some domain' when Colombe.Domain.equal domain domain' -> ()
-      | Some domain ->
-          Fmt.invalid_arg
-            "Facteur.many: recipient domain %a does not match destination %a"
-            Colombe.Domain.pp domain Colombe.Domain.pp domain
-      | None -> ()
-    in
-    List.iter fn rcpts
+  let check_domain (_from, rcpt) =
+    match domain_of_forward_path rcpt with
+    | Some domain' when Colombe.Domain.equal domain domain' -> ()
+    | Some domain ->
+        Fmt.invalid_arg
+          "Facteur.many: recipient domain %a does not match destination %a"
+          Colombe.Domain.pp domain Colombe.Domain.pp domain
+    | None -> ()
   in
   List.iter check_domain txs;
   Cattery.use t.pool @@ fun (decoder, encoder, queue) ->
@@ -170,7 +167,9 @@ let many t ~info resolver ~destination:domain txs seq =
           Msendmail.many ~encoder ~decoder ~queue t.he ~destination:dst
             ~domain:info.domain ?cfg:info.tls txs seq
         in
-        let fn = Result.map_error (fun err -> (err :> error)) in
+        let fn (fp, result) =
+          (fp, Result.map_error (fun err -> (err :> error)) result)
+        in
         Ok (List.map fn results)
     | (_mx, ipaddrs) :: mxs -> begin
         Log.debug (fun m ->
@@ -184,7 +183,9 @@ let many t ~info resolver ~destination:domain txs seq =
         in
         match result with
         | Ok results ->
-            let fn = Result.map_error (fun err -> (err :> error)) in
+            let fn (fp, result) =
+              (fp, Result.map_error (fun err -> (err :> error)) result)
+            in
             Ok (List.map fn results)
         | Error err ->
             Log.warn (fun m ->
@@ -217,7 +218,7 @@ let broadcast t ~info resolver ~from recipients seq =
   let prms =
     let fn (destination, rcpts) =
       Miou.async @@ fun () ->
-      let txs = [ (from, rcpts) ] in
+      let txs = List.map (fun rcpt -> (from, rcpt)) rcpts in
       (destination, many t ~info resolver ~destination txs seq)
     in
     List.map fn groups
@@ -226,9 +227,10 @@ let broadcast t ~info resolver ~from recipients seq =
   let fn = function
     | Ok (destination, Ok txs) ->
         let errors =
-          let fn = function
+          let fn (fp, result) =
+            match result with
             | Ok () -> None
-            | Error err -> Some (destination, err)
+            | Error err -> Some (destination, fp, err)
           in
           List.filter_map fn txs
         in

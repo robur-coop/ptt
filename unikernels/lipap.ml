@@ -195,10 +195,19 @@ let handler ~cfg ~info:(sinfo, cinfo) flow =
         let rcpts = List.map fst m.Ptt.recipients in
         let client = cfg.client in
         let errs = Facteur.broadcast client ~info resolver ~from rcpts seq in
-        let fn (domain, err) =
-          Logs.err (fun m ->
-              m "Impossible to send an email to %a: %a" Colombe.Domain.pp domain
-                Facteur.pp_error err)
+        let fn (_domain, fp, err) =
+          match fp with
+          | Colombe.Forward_path.Forward_path fp ->
+              begin match is_for_an_existing_mailing_list fp cfg.lists with
+              | Some (lst, fp) ->
+                  let _ = Mlm.failure_for lst ~from fp in
+                  cfg.lists <- S.add (Mlm.name lst) lst cfg.lists
+              | None -> ()
+              end;
+              Logs.err (fun m ->
+                  m "Impossible to send an email to %a: %a" Colombe.Path.pp fp
+                    Facteur.pp_error err)
+          | _ -> ()
         in
         List.iter fn errs
     | m ->
@@ -378,6 +387,7 @@ let lists ~info fs =
             let str = Jsont_bytesrw.encode_string (Lazy.force jsont) t in
             let str = Result.get_ok str in
             let process () =
+              (* TODO(dinosaure): should be an atomic operation (power failure). *)
               let* () = Fat.remove fs ("lists" / filepath) in
               Fat.write fs ("lists" / filepath) str
             in
