@@ -49,6 +49,7 @@ type outgoing = {
   ; seq: string Flux.stream Seq.t
 }
 
+type tx = { sender: Colombe.Reverse_path.t; recipient: Colombe.Forward_path.t }
 type error = [ `Msg of string ]
 
 val failure_for :
@@ -56,6 +57,12 @@ val failure_for :
   -> from:Colombe.Reverse_path.t
   -> Colombe.Path.t
   -> (unit, [> `Msg of string ]) result
+
+val outgoing :
+     t
+  -> from:Colombe.Reverse_path.t
+  -> rcpt:Colombe.Path.t
+  -> (t * tx list, error) result
 
 val incoming :
      t

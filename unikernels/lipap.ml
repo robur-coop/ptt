@@ -115,11 +115,9 @@ let resolver_according_to_peer ~cfg static flow =
       in
       Ptt.Resolver { gethostbyname; getmxbyname; dns= [ static ] }
 
-let send client ~info ?aresults lst ipaddr outgoing =
+let send_locally client ~info ?aresults lst ipaddr outgoing =
   let resolver = static ipaddr in
-  let fn lst outgoing =
-    let from = outgoing.Mlm.sender in
-    let rcpts = outgoing.Mlm.recipients in
+  let fn lst { Mlm.sender; recipients; seq } =
     let with_aresults stream =
       match aresults with
       | None -> stream
@@ -128,11 +126,28 @@ let send client ~info ?aresults lst ipaddr outgoing =
           let aresults = Flux.Stream.from aresults in
           Flux.Stream.concat aresults stream
     in
-    let seq = Seq.map with_aresults outgoing.Mlm.seq in
-    let _errs = Facteur.sendmail client ~info resolver ~from rcpts seq in
-    lst
+    let seq = Seq.map with_aresults seq in
+    let from = sender and rcpts = recipients in
+    let errs = Facteur.sendmail client ~info resolver ~from rcpts seq in
+    let fn (a, err) =
+      Logs.err (fun m ->
+          m "Impossible to send an email to %a: %a" Facteur.Aggregate.pp a
+            Facteur.pp_error err)
+    in
+    List.iter fn errs; lst
   in
   List.fold_left fn lst outgoing
+
+let broadcast client ~info resolver _lst outgoings seq =
+  let fn { Mlm.sender; recipient } = (sender, recipient) in
+  let txs = List.map fn outgoings in
+  let errs = Facteur.broadcast client ~info resolver txs seq in
+  let fn (_domain, fp, err) =
+    Logs.err (fun m ->
+        m "Impossible to send an email to %a: %a" Colombe.Forward_path.pp fp
+          Facteur.pp_error err)
+  in
+  List.iter fn errs
 
 let to_forward ~cfg flow =
   let _, (peer, _) = Mnet.TCP.peers flow in
@@ -185,29 +200,43 @@ let handler ~cfg ~info:(sinfo, cinfo) flow =
         assert (Miou.Computation.try_return oc `Ok);
         let from = Flux.Source.bqueue q in
         let stream = Flux.Stream.from from in
+        let mrcpts, rcpts =
+          let fn (fp, _) =
+            match fp with
+            | Colombe.Forward_path.Forward_path path ->
+                if is_us path sinfo.Ptt.domain then
+                  match is_for_an_existing_mailing_list path cfg.lists with
+                  | Some (lst, fp) -> Either.Left (lst, fp)
+                  | None -> Either.Right fp
+                else Either.Right fp
+            | _ -> Either.Right fp
+          in
+          List.partition_map fn m.Ptt.recipients
+        in
         let bstr = Flux.Stream.into (save_into v.contents) stream in
         let seq = Seq.forever @@ fun () -> Flux.Stream.from (from_bstr bstr) in
-        let info = cinfo in
         let from = fst m.Ptt.from in
-        Logs.debug (fun m ->
-            m "Forward incoming emails to Internet from %a"
-              Colombe.Reverse_path.pp from);
-        let rcpts = List.map fst m.Ptt.recipients in
-        let client = cfg.client in
-        let errs = Facteur.broadcast client ~info resolver ~from rcpts seq in
-        let fn (_domain, fp, err) =
-          match fp with
-          | Colombe.Forward_path.Forward_path fp ->
-              begin match is_for_an_existing_mailing_list fp cfg.lists with
-              | Some (lst, fp) ->
-                  let _ = Mlm.failure_for lst ~from fp in
-                  cfg.lists <- S.add (Mlm.name lst) lst cfg.lists
-              | None -> ()
-              end;
+        let fn (lst, rcpt) =
+          match Mlm.outgoing lst ~from ~rcpt with
+          | Ok (lst', txs) ->
+              let info = cinfo in
+              let client = cfg.client in
+              broadcast client ~info resolver lst' txs seq
+          | Error (`Msg msg) ->
               Logs.err (fun m ->
-                  m "Impossible to send an email to %a: %a" Colombe.Path.pp fp
-                    Facteur.pp_error err)
-          | _ -> ()
+                  m "Error during processing incoming email (local network): %s"
+                    msg)
+        in
+        List.iter fn mrcpts;
+        let info = cinfo in
+        let client = cfg.client in
+        let fn rcpt = (fst m.Ptt.from, rcpt) in
+        let txs = List.map fn rcpts in
+        let errs = Facteur.broadcast client ~info resolver txs seq in
+        let fn (_domain, fp, err) =
+          Logs.err (fun m ->
+              m "Impossible to send an email to %a: %a" Colombe.Forward_path.pp
+                fp Facteur.pp_error err)
         in
         List.iter fn errs
     | m ->
@@ -254,10 +283,14 @@ let handler ~cfg ~info:(sinfo, cinfo) flow =
                 let client = cfg.client in
                 let dst = cfg.to_arc in
                 let aresults = arc in
-                let lst' = send client ~info ~aresults lst' dst outgoing0 in
+                let lst' =
+                  send_locally client ~info ~aresults lst' dst outgoing0
+                in
                 let dst = cfg.to_dkim in
                 let aresults = dkim in
-                let lst' = send client ~info ~aresults lst' dst outgoing1 in
+                let lst' =
+                  send_locally client ~info ~aresults lst' dst outgoing1
+                in
                 cfg.lists <- S.add (Mlm.name lst') lst' cfg.lists
             | Error (`Msg msg) ->
                 Logs.err (fun m ->

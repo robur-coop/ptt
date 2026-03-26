@@ -200,25 +200,24 @@ let many t ~info resolver ~destination:domain txs seq =
 
 module By_domain = Map.Make (Colombe.Domain)
 
-let broadcast t ~info resolver ~from recipients seq =
-  if recipients = [] then
-    invalid_arg "Facteur.broadcast: recipients must not be empty";
+(* TODO(dinosaure): multiple [from] and multiple [recipients]. *)
+let broadcast t ~info resolver txs seq =
+  if txs = [] then invalid_arg "Facteur.broadcast: recipients must not be empty";
   let by_domain =
-    let fn acc rcpt =
+    let fn acc (sender, rcpt) =
       match domain_of_forward_path rcpt with
       | Some domain ->
           let vs = By_domain.find_opt domain acc in
           let vs = Option.value ~default:[] vs in
-          By_domain.add domain (rcpt :: vs) acc
+          By_domain.add domain ((sender, rcpt) :: vs) acc
       | None -> acc
     in
-    List.fold_left fn By_domain.empty recipients
+    List.fold_left fn By_domain.empty txs
   in
   let groups = By_domain.bindings by_domain in
   let prms =
-    let fn (destination, rcpts) =
+    let fn (destination, txs) =
       Miou.async @@ fun () ->
-      let txs = List.map (fun rcpt -> (from, rcpt)) rcpts in
       (destination, many t ~info resolver ~destination txs seq)
     in
     List.map fn groups

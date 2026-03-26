@@ -107,6 +107,8 @@ type outgoing = {
   ; seq: string Flux.stream Seq.t
 }
 
+type tx = { sender: Colombe.Reverse_path.t; recipient: Colombe.Forward_path.t }
+
 let make ~domain name =
   {
     name
@@ -337,8 +339,21 @@ let is_loop t bstr =
   let fn str = String.equal str our_listID in
   Ok (List.exists fn fields)
 
-let forward t ~from bstr =
+let rewrite_and_forward t ~from recipients bstr =
   let* seq = rewrite t ~from bstr in
+  Ok (t, [ { sender= from; recipients; seq } ], [])
+
+let forward_incoming t ~from recipients bstr =
+  let* is_loop = is_loop t bstr in
+  let is_subscriber =
+    let some = is_subscriber t in
+    Option.fold ~none:false ~some from
+  in
+  if (not is_loop) && is_subscriber then
+    rewrite_and_forward t ~from recipients bstr
+  else Ok (t, [], [])
+
+let forward_outgoing t =
   let fn subscriber =
     let verp = encode_verp subscriber in
     let local = Colombe_emile.to_local t.name in
@@ -347,22 +362,13 @@ let forward t ~from bstr =
     let local = String.split_on_char '.' local in
     let local = `Dot_string local in
     let sender = { Colombe.Path.local; domain= t.domain; rest= [] } in
-    let recipients = [ Colombe.Forward_path.Forward_path subscriber ] in
-    { sender= Some sender; recipients; seq }
+    let recipient = Colombe.Forward_path.Forward_path subscriber in
+    { sender= Some sender; recipient }
   in
   let ms = List.map fn t.subscribers in
   let t = { t with counter= t.counter + 1 } in
-  (* NOTE(dinosaure): save our new counter into our filesystem *)
   t.store t;
-  Ok (t, ms, [])
-
-let forward t ~from bstr =
-  let* is_loop = is_loop t bstr in
-  let is_subscriber =
-    let some = is_subscriber t in
-    Option.fold ~none:false ~some from
-  in
-  if (not is_loop) && is_subscriber then forward t ~from bstr else Ok (t, [], [])
+  Ok (t, ms)
 
 let _10d = Ptime.Span.of_int_s 864000
 
@@ -541,13 +547,26 @@ let failure_for t ~from forward_path =
           Ok ()
       end
 
-let incoming t ~from ~rcpt:{ Colombe.Path.local; _ } bstr =
+let outgoing t ~from ~rcpt:{ Colombe.Path.local; _ } =
   clean_up t;
   let local = Colombe.Path.Encoder.local_to_string local in
   let parts = String.split_on_char '-' local in
   let* rem = match_mailing_list t parts in
   begin match rem with
-  | [] -> forward t ~from bstr
+  | [] -> forward_outgoing t
+  | _ ->
+      Log.warn (fun m ->
+          m "Ignoring email from %a" Colombe.Reverse_path.pp from);
+      Ok (t, [])
+  end
+
+let incoming t ~from ~rcpt:({ Colombe.Path.local; _ } as rcpt) bstr =
+  clean_up t;
+  let local = Colombe.Path.Encoder.local_to_string local in
+  let parts = String.split_on_char '-' local in
+  let* rem = match_mailing_list t parts in
+  begin match rem with
+  | [] -> forward_incoming t ~from [ Forward_path rcpt ] bstr
   | [ "subscribe" ] -> subscribe t ~from
   | "subscribe" :: "accept" :: rem ->
       let verp = String.concat "-" rem in
@@ -597,16 +616,8 @@ let incoming t ~from ~rcpt:{ Colombe.Path.local; _ } bstr =
         Ok (t, [], [])
       end
       else Ok (t, [], [])
-  (*
-  | [ "subscribe" ] -> subscribe t from
-  | "subscribe" :: "reject" :: rem -> reject t from (String.concat "-" rem)
-  | "subscribe" :: "accept" :: rem | "subscribe" :: rem ->
-      confirmation t from (String.concat "-" rem)
-  | "return" :: rem -> bounce t (String.concat "-" rem)
-  | "moderate" :: "accept" :: rem -> accept t from (String.concat "-" rem)
-  | "moderate" :: "reject" :: rem -> disallow t flow (String.concat "-" rem)
-  *)
   | _ ->
-      Log.warn (fun m -> m "Ignoring email to %a" Colombe.Reverse_path.pp from);
+      Log.warn (fun m ->
+          m "Ignoring email from %a" Colombe.Reverse_path.pp from);
       Ok (t, [], [])
   end

@@ -79,8 +79,7 @@ val broadcast :
      t
   -> info:info
   -> Ptt.resolver
-  -> from:Colombe.Reverse_path.t
-  -> Colombe.Forward_path.t list
+  -> (Colombe.Reverse_path.t * Colombe.Forward_path.t) list
   -> string Flux.stream Seq.t
   -> (Colombe.Domain.t * Colombe.Forward_path.t * error) list
 (** [broadcast t ~info resolver ~from recipients email] sends [email] from
