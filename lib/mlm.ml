@@ -73,7 +73,6 @@ type t = {
   ; subscribers: Colombe.Path.t list
   ; moderators: Colombe.Path.t list
   ; pending: Pending_subscriptions.t
-  ; bounces: (Colombe.Path.t, int list) Hashtbl.t
   ; store: t -> unit
 }
 
@@ -117,7 +116,6 @@ let make ~domain name =
   ; subscribers= []
   ; moderators= []
   ; pending= Pending_subscriptions.create 0x7ff
-  ; bounces= Hashtbl.create 0x7ff
   ; store= ignore
   }
 
@@ -163,17 +161,7 @@ let json ?(store = ignore) ~domain name =
   let open Jsont.Object in
   map (fun counter subscribers moderators ->
       let pending = Pending_subscriptions.create 0x7ff in
-      let bounces (* TODO *) = Hashtbl.create 0x7ff in
-      {
-        name
-      ; domain
-      ; counter
-      ; subscribers
-      ; moderators
-      ; pending
-      ; bounces
-      ; store
-      })
+      { name; domain; counter; subscribers; moderators; pending; store })
   |> mem "counter" ~enc:(fun t -> t.counter) Jsont.int
   |> mem "subscribers" ~enc:(fun t -> t.subscribers) (Jsont.list path)
   |> mem "moderators" ~enc:(fun t -> t.moderators) (Jsont.list path)
@@ -228,7 +216,7 @@ let make_new_from t ~from =
     | Some path ->
         let verp = encode_verp path in
         let str = Fmt.str "%s via %a" verp Emile.pp_local t.name in
-        Some Phrase.(v [ e ~encoding:q str ])
+        Some Phrase.(v [ w str ])
   in
   let domain = Colombe_emile.of_domain t.domain in
   make ?name t.name domain
@@ -354,11 +342,12 @@ let forward_incoming t ~from recipients bstr =
   else Ok (t, [], [])
 
 let forward_outgoing t =
+  let counter = t.counter in
   let fn subscriber =
     let verp = encode_verp subscriber in
     let local = Colombe_emile.to_local t.name in
     let local = Colombe.Path.Encoder.local_to_string local in
-    let local = Fmt.str "%s-return-%d-%s" local t.counter verp in
+    let local = Fmt.str "%s-return-%d-%s" local counter verp in
     let local = String.split_on_char '.' local in
     let local = `Dot_string local in
     let sender = { Colombe.Path.local; domain= t.domain; rest= [] } in
@@ -366,11 +355,78 @@ let forward_outgoing t =
     { sender= Some sender; recipient }
   in
   let ms = List.map fn t.subscribers in
-  let t = { t with counter= t.counter + 1 } in
+  let t = { t with counter= counter + 1 } in
   t.store t;
-  Ok (t, ms)
+  Ok (t, counter, ms)
 
 let _10d = Ptime.Span.of_int_s 864000
+
+let craft t ~subject ~dsts:to_ body =
+  let open Mrmime in
+  let messageID = Field.Field (Field_name.message_id, MessageID, messageID t) in
+  let mime_version =
+    let open Unstructured.Craft in
+    let value = compile [ v "1.0" ] in
+    Field.Field (Field_name.mime_version, Unstructured, value)
+  in
+  let date =
+    let now = Mirage_ptime.now () in
+    let now = Date.of_ptime ~zone:Date.Zone.GMT now in
+    Field.Field (Field_name.date, Date, now)
+  in
+  let subject = Field.Field (Field_name.subject, Unstructured, subject) in
+  let sender = Field.Field (Field_name.sender, Mailbox, to_emile t) in
+  let content_type =
+    let open Content_type in
+    let params = Parameters.of_list [ ("charset", `Token "utf-8") ] in
+    let v = make `Text (`Iana_token "plain") params in
+    Field.Field (Field_name.content_type, Content, v)
+  in
+  let to_ =
+    let fn m = `Mailbox (Colombe_emile.of_path m) in
+    let addresses = List.map fn to_ in
+    Field.Field (Field_name.v "To", Addresses, addresses)
+  in
+  let hdrs =
+    let from = Field.Field (Field_name.from, Mailboxes, [ to_emile t ]) in
+    Header.of_list
+      [
+        messageID; mime_version; date; subject; from; sender; content_type; to_
+      ]
+  in
+  Seq.forever @@ fun () ->
+  let consumed = ref false in
+  let body () =
+    if !consumed then None
+    else begin
+      consumed := true;
+      let len = String.length body in
+      Some (body, 0, len)
+    end
+  in
+  let m = Mt.make hdrs Mt.simple (Mt.part body) in
+  let dispenser = Mt.to_stream m in
+  let seq = Seq.of_dispenser dispenser in
+  let seq = Seq.map (fun (str, off, len) -> String.sub str off len) seq in
+  Flux.Source.seq seq |> Flux.Stream.from
+
+let subscribers t ~from =
+  let open Mrmime in
+  let subject =
+    let open Unstructured.Craft in
+    compile
+      [ v (Fmt.str "List of subscribers for %a" Emile.pp_mailbox (to_emile t)) ]
+  in
+  let dsts = match from with None -> [] | Some path -> [ path ] in
+  let fn = Fmt.str "- %a\r\n" Colombe.Path.pp in
+  let subscribers = List.map fn t.subscribers in
+  let body = "List of current subscribers:\r\n" :: subscribers in
+  let seq = craft t ~subject ~dsts (String.concat "" body) in
+  let us = Colombe_emile.to_path (to_emile t) in
+  let recipients =
+    List.map (fun p -> Colombe.Forward_path.Forward_path p) dsts
+  in
+  Ok (t, [], [ { sender= Some us; recipients; seq } ])
 
 let subscribe t ~from =
   let already_subscriber =
@@ -385,44 +441,11 @@ let subscribe t ~from =
   else
     let open Mrmime in
     (* NOTE(dinosaure): let's craft a new email! *)
-    let sender = Field.Field (Field_name.sender, Mailbox, to_emile t) in
     let subject =
       let open Unstructured.Craft in
-      let value = compile [ v "New subscription" ] in
-      Field.Field (Field_name.subject, Unstructured, value)
+      compile [ v "New subscription" ]
     in
-    let date =
-      let now = Mirage_ptime.now () in
-      let now = Date.of_ptime ~zone:Date.Zone.GMT now in
-      Field.Field (Field_name.date, Date, now)
-    in
-    let mime_version =
-      let open Unstructured.Craft in
-      let value = compile [ v "1.0" ] in
-      Field.Field (Field_name.mime_version, Unstructured, value)
-    in
-    let content_type =
-      let open Content_type in
-      let params = Parameters.of_list [ ("charset", `Token "utf-8") ] in
-      let v = make `Text (`Iana_token "plain") params in
-      Field.Field (Field_name.content_type, Content, v)
-    in
-    let to_ =
-      let fn m = `Mailbox (Colombe_emile.of_path m) in
-      let addresses = List.map fn t.moderators in
-      Field.Field (Field_name.v "To", Addresses, addresses)
-    in
-    let messageID =
-      Field.Field (Field_name.message_id, MessageID, messageID t)
-    in
-    let hdrs =
-      let from = Field.Field (Field_name.from, Mailboxes, [ to_emile t ]) in
-      Header.of_list
-        [
-          messageID; mime_version; date; subject; from; sender; content_type
-        ; to_
-        ]
-    in
+    let dsts = t.moderators in
     let to_accept =
       let from = Option.get from in
       let local =
@@ -455,30 +478,14 @@ let subscribe t ~from =
         (Colombe.Forward_path.Encoder.to_string to_accept)
         (Colombe.Forward_path.Encoder.to_string to_reject)
     in
-    let seq =
-      Seq.forever @@ fun () ->
-      let consumed = ref false in
-      let body () =
-        if !consumed then None
-        else begin
-          consumed := true;
-          let len = String.length body in
-          Some (body, 0, len)
-        end
-      in
-      let m = Mt.make hdrs Mt.simple (Mt.part body) in
-      let dispenser = Mt.to_stream m in
-      let seq = Seq.of_dispenser dispenser in
-      let seq = Seq.map (fun (str, off, len) -> String.sub str off len) seq in
-      Flux.Source.seq seq |> Flux.Stream.from
-    in
+    let seq = craft t ~subject ~dsts body in
     let fn moderator =
       let sender = to_emile t in
       let sender = Colombe_emile.to_path sender in
       let recipients = [ Colombe.Forward_path.Forward_path moderator ] in
       { sender= Some sender; recipients; seq }
     in
-    let ms = List.map fn t.moderators in
+    let ms = List.map fn dsts in
     let fn from =
       let now = Mirage_ptime.now () in
       let expire_at = Ptime.add_span now _10d in
@@ -507,8 +514,6 @@ let match_mailing_list t parts =
   in
   go name parts
 
-type error = [ `Msg of string ]
-
 let rec clean_up t =
   let than = Mirage_ptime.now () in
   match Pending_subscriptions.lru t.pending with
@@ -518,34 +523,6 @@ let rec clean_up t =
       Pending_subscriptions.remove k t.pending;
       clean_up t
   | _ -> ()
-
-let failure_for t ~from forward_path =
-  let counter = function
-    | _name :: "return" :: counter :: _ ->
-        let none = msgf "Invalid counter" in
-        Option.to_result ~none (int_of_string_opt counter)
-    | _ -> error_msgf "Invalid return-path email address"
-  in
-  match from with
-  | None -> Ok ()
-  | Some { Colombe.Path.local; _ } ->
-      let local = Colombe.Path.Encoder.local_to_string local in
-      let parts = String.split_on_char '-' local in
-      let* counter = counter parts in
-      begin match Hashtbl.find_opt t.bounces forward_path with
-      | Some attempts when List.length attempts < 3 ->
-          let attempts = List.sort_uniq Int.compare (counter :: attempts) in
-          Hashtbl.replace t.bounces forward_path attempts;
-          Ok ()
-      | Some _ ->
-          Log.debug (fun m ->
-              m "Too many failures for %a, remove it as a subscriber for %a"
-                Colombe.Path.pp forward_path Emile.pp_mailbox (to_emile t));
-          Ok ()
-      | None ->
-          Hashtbl.add t.bounces forward_path [ counter ];
-          Ok ()
-      end
 
 let outgoing t ~from ~rcpt:{ Colombe.Path.local; _ } =
   clean_up t;
@@ -557,10 +534,10 @@ let outgoing t ~from ~rcpt:{ Colombe.Path.local; _ } =
   | _ ->
       Log.warn (fun m ->
           m "Ignoring email from %a" Colombe.Reverse_path.pp from);
-      Ok (t, [])
+      Ok (t, t.counter, [])
   end
 
-let incoming t ~from ~rcpt:({ Colombe.Path.local; _ } as rcpt) bstr =
+let incoming t bounces ~from ~rcpt:({ Colombe.Path.local; _ } as rcpt) bstr =
   clean_up t;
   let local = Colombe.Path.Encoder.local_to_string local in
   let parts = String.split_on_char '-' local in
@@ -568,6 +545,26 @@ let incoming t ~from ~rcpt:({ Colombe.Path.local; _ } as rcpt) bstr =
   begin match rem with
   | [] -> forward_incoming t ~from [ Forward_path rcpt ] bstr
   | [ "subscribe" ] -> subscribe t ~from
+  | [ "subscribers" ] ->
+      let none = false and some = is_subscriber t in
+      if Option.fold ~none ~some from then subscribers t ~from
+      else Ok (t, [], [])
+  | [ "unsubscribe" ] ->
+      let none = false and some = is_subscriber t in
+      if Option.fold ~none ~some from then begin
+        Log.debug (fun m ->
+            m "%a unsuscribes to %a" Colombe.Reverse_path.pp from
+              Emile.pp_mailbox (to_emile t));
+        let fn =
+          match from with
+          | None -> Fun.const false
+          | Some path -> Colombe.Path.equal path
+        in
+        let subscribers = List.filter (Fun.negate fn) t.subscribers in
+        let t = { t with subscribers } in
+        t.store t
+      end;
+      Ok (t, [], [])
   | "subscribe" :: "accept" :: rem ->
       let verp = String.concat "-" rem in
       let* new_subscriber = decode_verp verp in
@@ -600,22 +597,9 @@ let incoming t ~from ~rcpt:({ Colombe.Path.local; _ } as rcpt) bstr =
         let none = msgf "Invalid counter" in
         Option.to_result ~none (int_of_string_opt counter)
       in
-      if is_subscriber t forward_path then begin
-        Log.debug (fun m ->
-            m "Received a failure for %a" Colombe.Path.pp forward_path);
-        begin match Hashtbl.find_opt t.bounces forward_path with
-        | Some attempts when List.length attempts < 3 ->
-            let attempts = List.sort_uniq Int.compare (counter :: attempts) in
-            Hashtbl.replace t.bounces forward_path attempts
-        | Some _ ->
-            Log.debug (fun m ->
-                m "Too many failures for %a, remove it as a subscriber for %a"
-                  Colombe.Path.pp forward_path Emile.pp_mailbox (to_emile t))
-        | None -> Hashtbl.add t.bounces forward_path [ counter ]
-        end;
-        Ok (t, [], [])
-      end
-      else Ok (t, [], [])
+      if is_subscriber t forward_path then
+        Bounces.signaled_for bounces ~counter forward_path;
+      Ok (t, [], [])
   | _ ->
       Log.warn (fun m ->
           m "Ignoring email from %a" Colombe.Reverse_path.pp from);

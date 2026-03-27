@@ -224,27 +224,13 @@ let broadcast t ~info resolver txs seq =
   in
   let results = Miou.await_all prms in
   let fn = function
-    | Ok (destination, Ok txs) ->
-        let errors =
-          let fn (fp, result) =
-            match result with
-            | Ok () -> None
-            | Error err -> Some (destination, fp, err)
-          in
-          List.filter_map fn txs
-        in
-        if errors = [] then None else Some errors
-    | Ok (destination, Error err) ->
-        Log.err (fun m ->
-            m "Failed to send to %a: %a" Colombe.Domain.pp destination
-              Msendmail.pp_error err);
-        None
-    | Error exn ->
-        Log.err (fun m ->
-            m "Got an unexpected exception: %s" (Printexc.to_string exn));
-        None
+    | Error _exn -> []
+    | Ok (_, Error _err) -> []
+    | Ok (destination, Ok results) ->
+        let fn (fp, result) = (destination, fp, result) in
+        List.map fn results
   in
-  List.filter_map fn results |> List.flatten
+  List.map fn results |> List.flatten
 
 let sendmail t ~info resolver ~from recipients seq =
   if recipients = [] then

@@ -50,23 +50,17 @@ type outgoing = {
 }
 
 type tx = { sender: Colombe.Reverse_path.t; recipient: Colombe.Forward_path.t }
-type error = [ `Msg of string ]
-
-val failure_for :
-     t
-  -> from:Colombe.Reverse_path.t
-  -> Colombe.Path.t
-  -> (unit, [> `Msg of string ]) result
 
 val outgoing :
      t
   -> from:Colombe.Reverse_path.t
   -> rcpt:Colombe.Path.t
-  -> (t * tx list, error) result
+  -> (t * int * tx list, [> `Msg of string ]) result
 
 val incoming :
      t
+  -> Bounces.t
   -> from:Colombe.Reverse_path.t
   -> rcpt:Colombe.Path.t
   -> Bstr.t
-  -> (t * outgoing list * outgoing list, error) result
+  -> (t * outgoing list * outgoing list, [ `Msg of string ]) result

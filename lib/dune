@@ -30,6 +30,28 @@
   mirage-ptime
   mirage-crypto-rng
   ptt.mailto
+  ptt.bounces
+  lru
+  uuidm
+  hxd.string
+  hxd.core
+  colombe.emile
+  flux
+  logs
+  mrmime
+  prettym
+  colombe
+  bstr
+  jsont))
+
+(library
+ (name bounces)
+ (public_name ptt.bounces)
+ (modules bounces)
+ (libraries
+  mirage-ptime
+  mirage-crypto-rng
+  ptt.mailto
   lru
   uuidm
   hxd.string

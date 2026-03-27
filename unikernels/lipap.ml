@@ -32,62 +32,246 @@ type value = {
   ; contents: Bstr.t
 }
 
-let aresults ~receiver ppf =
-  let open Prettym in
-  eval ppf
-    [
-      string $ "Authentication-Results"; char $ ':'; spaces 1
-    ; !!(Dmarc.Encoder.field ~receiver)
-    ]
-
-let last_arc_set hdrs =
-  let is_arc_seal =
-    let open Mrmime.Field_name in
-    equal (v "ARC-Seal")
-  in
-  let get_arc_signature unstrctrd =
-    let* m = Dkim.of_unstrctrd_to_map unstrctrd in
-    let none = msgf "Missing i ARC field" in
-    let* i = Option.to_result ~none (Dkim.get_key "i" m) in
-    let none = msgf "Invalid unique ARC ID value" in
-    let* i = Option.to_result ~none (int_of_string_opt i) in
-    let* t = Dkim.map_to_t m in
-    Ok (i, t, m)
-  in
-  let rec go uid = function
-    | (field_name, unstrctrd) :: hdrs ->
-        if is_arc_seal field_name then
-          match get_arc_signature unstrctrd with
-          | Ok (uid', _, _) -> go (Int.max uid uid') hdrs
-          | Error _ -> go uid hdrs
-        else go uid hdrs
-    | [] -> uid
-  in
-  go 0 hdrs
-
-let receiver ~info =
-  match info.Ptt.domain with
-  | Colombe.Domain.Domain ds -> `Domain ds
-  | IPv4 ipv4 -> `Addr (Emile.IPv4 ipv4)
-  | IPv6 ipv6 -> `Addr (Emile.IPv6 ipv6)
-  | Extension (k, v) -> `Addr (Emile.Ext (k, v))
-
 type cfg = {
     forward: Ipaddr.t -> bool
   ; pool: value Cattery.t
   ; dns: Mnet_dns.t
   ; client: Facteur.t
   ; mutable lists: Mlm.t S.t
+  ; bounces: Bounces.t
   ; to_arc: Ipaddr.t
   ; to_dkim: Ipaddr.t
 }
 
-let static destination =
-  let gethostbyname ipaddrs _ = Result.ok ipaddrs
-  and getmxbyname _ mail_exchange =
-    Ok (Dns.Rr_map.Mx_set.singleton { preference= 0; mail_exchange })
-  in
-  Ptt.Resolver { gethostbyname; getmxbyname; dns= [ destination ] }
+let is_us { Colombe.Path.domain; _ } domain' =
+  Colombe.Domain.equal domain domain'
+
+let is_for_an_existing_mailing_list ({ Colombe.Path.local; _ } as fp) lsts =
+  let local = Colombe.Path.Encoder.local_to_string local in
+  let local = List.hd (String.split_on_char '-' local) in
+  match S.find_opt local lsts with Some lst -> Some (lst, fp) | None -> None
+
+module Incoming = struct
+  let aresults ~receiver ppf =
+    let open Prettym in
+    eval ppf
+      [
+        string $ "Authentication-Results"; char $ ':'; spaces 1
+      ; !!(Dmarc.Encoder.field ~receiver)
+      ]
+
+  let last_arc_set hdrs =
+    let is_arc_seal =
+      let open Mrmime.Field_name in
+      equal (v "ARC-Seal")
+    in
+    let get_arc_signature unstrctrd =
+      let* m = Dkim.of_unstrctrd_to_map unstrctrd in
+      let none = msgf "Missing i ARC field" in
+      let* i = Option.to_result ~none (Dkim.get_key "i" m) in
+      let none = msgf "Invalid unique ARC ID value" in
+      let* i = Option.to_result ~none (int_of_string_opt i) in
+      let* t = Dkim.map_to_t m in
+      Ok (i, t, m)
+    in
+    let rec go uid = function
+      | (field_name, unstrctrd) :: hdrs ->
+          if is_arc_seal field_name then
+            match get_arc_signature unstrctrd with
+            | Ok (uid', _, _) -> go (Int.max uid uid') hdrs
+            | Error _ -> go uid hdrs
+          else go uid hdrs
+      | [] -> uid
+    in
+    go 0 hdrs
+
+  let receiver ~info =
+    match info.Ptt.domain with
+    | Colombe.Domain.Domain ds -> `Domain ds
+    | IPv4 ipv4 -> `Addr (Emile.IPv4 ipv4)
+    | IPv6 ipv6 -> `Addr (Emile.IPv6 ipv6)
+    | Extension (k, v) -> `Addr (Emile.Ext (k, v))
+
+  let static destination =
+    let gethostbyname ipaddrs _ = Result.ok ipaddrs
+    and getmxbyname _ mail_exchange =
+      Ok (Dns.Rr_map.Mx_set.singleton { preference= 0; mail_exchange })
+    in
+    Ptt.Resolver { gethostbyname; getmxbyname; dns= [ destination ] }
+
+  let send_locally client ~info ?aresults lst ipaddr outgoing =
+    let resolver = static ipaddr in
+    let fn lst { Mlm.sender; recipients; seq } =
+      let with_aresults stream =
+        match aresults with
+        | None -> stream
+        | Some aresults ->
+            let aresults = Flux.Source.list [ aresults ] in
+            let aresults = Flux.Stream.from aresults in
+            Flux.Stream.concat aresults stream
+      in
+      let seq = Seq.map with_aresults seq in
+      let from = sender and rcpts = recipients in
+      let errs = Facteur.sendmail client ~info resolver ~from rcpts seq in
+      let fn (a, err) =
+        Logs.err (fun m ->
+            m "Impossible to send an email to %a: %a" Facteur.Aggregate.pp a
+              Facteur.pp_error err)
+      in
+      List.iter fn errs; lst
+    in
+    List.fold_left fn lst outgoing
+
+  let handler ~cfg ~info:(sinfo, cinfo) peer m oc q v =
+    (* Here, we analyse the email (SPF, DKIM and DMARC validation) and then let
+       our [Mlm] module handle the email according to the mailing lists. In all
+       cases, an {ARC-,}Authentication-Results header is added.
+
+       The mailing list logic may need to send emails to our ARC signer (this is
+       the case when acting as a relay) or to our DKIM signer (when the mailing
+       list wants to create and send a new email). More generally, incoming
+       emails are only intended for our local network.
+
+       If we are unable to parse the email or properly verify SPF, DKIM and
+       DMARC, we simply ignore the email. *)
+    Logs.debug (fun m -> m "Analyze incoming emails from Internet");
+    assert (Miou.Computation.try_return oc `Ok);
+    let src = Flux.Source.bqueue q in
+    let stream = Flux.Stream.from src in
+    let from = fst m.Ptt.from in
+    let rcpts =
+      let fn (fp, _) =
+        match fp with
+        | Colombe.Forward_path.Forward_path path ->
+            if is_us path sinfo.Ptt.domain then
+              is_for_an_existing_mailing_list path cfg.lists
+            else None
+        | _ -> None
+      in
+      List.filter_map fn m.Ptt.recipients
+    in
+    if not (List.is_empty rcpts) then begin
+      let ctx = Uspf.empty in
+      let ctx = Uspf.with_ip peer ctx in
+      let ctx =
+        let some v = Uspf.with_sender (`MAILFROM v) ctx in
+        Option.fold ~none:ctx ~some from
+      in
+      let into =
+        let open Flux.Sink.Syntax in
+        let+ bstr = save_into v.contents
+        and+ dmarc = dmarc ~ctx cfg.dns
+        and+ hdrs = headers in
+        (bstr, hdrs, dmarc)
+      in
+      Logs.debug (fun m -> m "Consume incoming email");
+      let bstr, hdrs, dmarc = Flux.Stream.into into stream in
+      Logs.debug (fun m ->
+          let hash = Digestif.SHA256.digest_bigstring bstr in
+          m "Incoming email: %a" Digestif.SHA256.pp hash);
+      let fn (arc, dkim) (lst, rcpt) =
+        match Mlm.incoming lst cfg.bounces ~from ~rcpt bstr with
+        | Ok (lst', outgoing0, outgoing1) ->
+            let info = cinfo in
+            let client = cfg.client in
+            let dst = cfg.to_arc in
+            let aresults = arc in
+            let lst' = send_locally client ~info ~aresults lst' dst outgoing0 in
+            let dst = cfg.to_dkim in
+            let aresults = dkim in
+            let lst' = send_locally client ~info ~aresults lst' dst outgoing1 in
+            cfg.lists <- S.add (Mlm.name lst') lst' cfg.lists
+        | Error (`Msg msg) ->
+            Logs.err (fun m ->
+                m "Error during processing incoming email: %s" msg)
+      in
+      begin match (hdrs, dmarc) with
+      | Ok hdrs, Ok dmarc ->
+          let receiver = receiver ~info:sinfo in
+          let arc_authentication_results =
+            let uid = succ (last_arc_set hdrs) in
+            let encoder = Arc.Encoder.stamp_results ~receiver ~uid in
+            Prettym.to_string ~new_line:"\r\n" encoder dmarc
+          in
+          let authentication_results =
+            let encoder = aresults ~receiver in
+            Prettym.to_string ~new_line:"\r\n" encoder dmarc
+          in
+          let v = (arc_authentication_results, authentication_results) in
+          List.iter (fn v) rcpts
+      | _, Error err -> Logs.err (fun m -> m "DMARC error: %a" pp_error err)
+      | Error err, _ ->
+          Logs.err (fun m -> m "Invalid incoming email: %a" pp_error err)
+      end
+    end
+end
+
+module Outgoing = struct
+  let broadcast cfg client ~info resolver _lst ~counter txs seq =
+    let fn { Mlm.sender; recipient } = (sender, recipient) in
+    let txs = List.map fn txs in
+    let results = Facteur.broadcast client ~info resolver txs seq in
+    let fn (_domain, fp, result) =
+      match (result, fp) with
+      | Error err, Colombe.Forward_path.Forward_path fp ->
+          Logs.err (fun m ->
+              m "Impossible to send an email to %a: %a" Colombe.Path.pp fp
+                Facteur.pp_error err);
+          Bounces.failure_for cfg.bounces ~counter fp
+      | Ok (), Colombe.Forward_path.Forward_path fp ->
+          Bounces.success_for cfg.bounces ~counter fp;
+          None
+      | _ -> None
+    in
+    let _to_delete = List.filter_map fn results in
+    ()
+
+  let handler ~cfg ~info:(sinfo, cinfo) resolver m oc q v =
+    assert (Miou.Computation.try_return oc `Ok);
+    let from = Flux.Source.bqueue q in
+    let stream = Flux.Stream.from from in
+    let mrcpts, rcpts =
+      let fn (fp, _) =
+        match fp with
+        | Colombe.Forward_path.Forward_path path ->
+            if is_us path sinfo.Ptt.domain then
+              match is_for_an_existing_mailing_list path cfg.lists with
+              | Some (lst, fp) -> Either.Left (lst, fp)
+              | None -> Either.Right fp
+            else Either.Right fp
+        | _ -> Either.Right fp
+      in
+      List.partition_map fn m.Ptt.recipients
+    in
+    let bstr = Flux.Stream.into (save_into v.contents) stream in
+    let seq = Seq.forever @@ fun () -> Flux.Stream.from (from_bstr bstr) in
+    let from = fst m.Ptt.from in
+    let fn (lst, rcpt) =
+      match Mlm.outgoing lst ~from ~rcpt with
+      | Ok (lst', counter, txs) ->
+          let info = cinfo in
+          let client = cfg.client in
+          broadcast cfg client ~info resolver lst' ~counter txs seq
+      | Error (`Msg msg) ->
+          Logs.err (fun m ->
+              m "Error during processing incoming email (local network): %s" msg)
+    in
+    List.iter fn mrcpts;
+    let info = cinfo in
+    let client = cfg.client in
+    let fn rcpt = (fst m.Ptt.from, rcpt) in
+    let txs = List.map fn rcpts in
+    let errs = Facteur.broadcast client ~info resolver txs seq in
+    let fn (_domain, fp, result) =
+      match result with
+      | Ok () -> ()
+      | Error err ->
+          Logs.err (fun m ->
+              m "Impossible to send an email to %a: %a" Colombe.Forward_path.pp
+                fp Facteur.pp_error err)
+    in
+    List.iter fn errs
+end
 
 let resolver_according_to_peer ~cfg static flow =
   let _, (peer, _) = Mnet.TCP.peers flow in
@@ -115,53 +299,11 @@ let resolver_according_to_peer ~cfg static flow =
       in
       Ptt.Resolver { gethostbyname; getmxbyname; dns= [ static ] }
 
-let send_locally client ~info ?aresults lst ipaddr outgoing =
-  let resolver = static ipaddr in
-  let fn lst { Mlm.sender; recipients; seq } =
-    let with_aresults stream =
-      match aresults with
-      | None -> stream
-      | Some aresults ->
-          let aresults = Flux.Source.list [ aresults ] in
-          let aresults = Flux.Stream.from aresults in
-          Flux.Stream.concat aresults stream
-    in
-    let seq = Seq.map with_aresults seq in
-    let from = sender and rcpts = recipients in
-    let errs = Facteur.sendmail client ~info resolver ~from rcpts seq in
-    let fn (a, err) =
-      Logs.err (fun m ->
-          m "Impossible to send an email to %a: %a" Facteur.Aggregate.pp a
-            Facteur.pp_error err)
-    in
-    List.iter fn errs; lst
-  in
-  List.fold_left fn lst outgoing
-
-let broadcast client ~info resolver _lst outgoings seq =
-  let fn { Mlm.sender; recipient } = (sender, recipient) in
-  let txs = List.map fn outgoings in
-  let errs = Facteur.broadcast client ~info resolver txs seq in
-  let fn (_domain, fp, err) =
-    Logs.err (fun m ->
-        m "Impossible to send an email to %a: %a" Colombe.Forward_path.pp fp
-          Facteur.pp_error err)
-  in
-  List.iter fn errs
-
 let to_forward ~cfg flow =
   let _, (peer, _) = Mnet.TCP.peers flow in
   cfg.forward peer
 
-let is_us { Colombe.Path.domain; _ } domain' =
-  Colombe.Domain.equal domain domain'
-
-let is_for_an_existing_mailing_list ({ Colombe.Path.local; _ } as fp) lsts =
-  let local = Colombe.Path.Encoder.local_to_string local in
-  let local = List.hd (String.split_on_char '-' local) in
-  match S.find_opt local lsts with Some lst -> Some (lst, fp) | None -> None
-
-let handler ~cfg ~info:(sinfo, cinfo) flow =
+let handler ~cfg ~info:((sinfo, _) as info) flow =
   Cattery.use cfg.pool @@ fun v ->
   let forward = to_forward ~cfg flow in
   (* NOTE(dinosaure): here, we use [to_arc] but we can also use [to_dkim]
@@ -195,126 +337,8 @@ let handler ~cfg ~info:(sinfo, cinfo) flow =
   let prm1 =
     Miou.async @@ fun () ->
     match Miou.Computation.await_exn ic with
-    | m when forward ->
-        (* Email comes from local network (nec): forward to real destinations *)
-        assert (Miou.Computation.try_return oc `Ok);
-        let from = Flux.Source.bqueue q in
-        let stream = Flux.Stream.from from in
-        let mrcpts, rcpts =
-          let fn (fp, _) =
-            match fp with
-            | Colombe.Forward_path.Forward_path path ->
-                if is_us path sinfo.Ptt.domain then
-                  match is_for_an_existing_mailing_list path cfg.lists with
-                  | Some (lst, fp) -> Either.Left (lst, fp)
-                  | None -> Either.Right fp
-                else Either.Right fp
-            | _ -> Either.Right fp
-          in
-          List.partition_map fn m.Ptt.recipients
-        in
-        let bstr = Flux.Stream.into (save_into v.contents) stream in
-        let seq = Seq.forever @@ fun () -> Flux.Stream.from (from_bstr bstr) in
-        let from = fst m.Ptt.from in
-        let fn (lst, rcpt) =
-          match Mlm.outgoing lst ~from ~rcpt with
-          | Ok (lst', txs) ->
-              let info = cinfo in
-              let client = cfg.client in
-              broadcast client ~info resolver lst' txs seq
-          | Error (`Msg msg) ->
-              Logs.err (fun m ->
-                  m "Error during processing incoming email (local network): %s"
-                    msg)
-        in
-        List.iter fn mrcpts;
-        let info = cinfo in
-        let client = cfg.client in
-        let fn rcpt = (fst m.Ptt.from, rcpt) in
-        let txs = List.map fn rcpts in
-        let errs = Facteur.broadcast client ~info resolver txs seq in
-        let fn (_domain, fp, err) =
-          Logs.err (fun m ->
-              m "Impossible to send an email to %a: %a" Colombe.Forward_path.pp
-                fp Facteur.pp_error err)
-        in
-        List.iter fn errs
-    | m ->
-        (* Email comes from outside: MLM processing + send to nec *)
-        Logs.debug (fun m -> m "Analyze incoming emails from Internet");
-        assert (Miou.Computation.try_return oc `Ok);
-        let src = Flux.Source.bqueue q in
-        let stream = Flux.Stream.from src in
-        let from = fst m.Ptt.from in
-        let rcpts =
-          let fn (fp, _) =
-            match fp with
-            | Colombe.Forward_path.Forward_path path ->
-                if is_us path sinfo.Ptt.domain then
-                  is_for_an_existing_mailing_list path cfg.lists
-                else None
-            | _ -> None
-          in
-          List.filter_map fn m.Ptt.recipients
-        in
-        if not (List.is_empty rcpts) then begin
-          let ctx = Uspf.empty in
-          let ctx = Uspf.with_ip peer ctx in
-          let ctx =
-            let some v = Uspf.with_sender (`MAILFROM v) ctx in
-            Option.fold ~none:ctx ~some from
-          in
-          let into =
-            let open Flux.Sink.Syntax in
-            let+ bstr = save_into v.contents
-            and+ dmarc = dmarc ~ctx cfg.dns
-            and+ hdrs = headers in
-            (bstr, hdrs, dmarc)
-          in
-          Logs.debug (fun m -> m "Consume incoming email");
-          let bstr, hdrs, dmarc = Flux.Stream.into into stream in
-          Logs.debug (fun m ->
-              let hash = Digestif.SHA256.digest_bigstring bstr in
-              m "Incoming email: %a" Digestif.SHA256.pp hash);
-          let fn (arc, dkim) (lst, rcpt) =
-            match Mlm.incoming lst ~from ~rcpt bstr with
-            | Ok (lst', outgoing0, outgoing1) ->
-                let info = cinfo in
-                let client = cfg.client in
-                let dst = cfg.to_arc in
-                let aresults = arc in
-                let lst' =
-                  send_locally client ~info ~aresults lst' dst outgoing0
-                in
-                let dst = cfg.to_dkim in
-                let aresults = dkim in
-                let lst' =
-                  send_locally client ~info ~aresults lst' dst outgoing1
-                in
-                cfg.lists <- S.add (Mlm.name lst') lst' cfg.lists
-            | Error (`Msg msg) ->
-                Logs.err (fun m ->
-                    m "Error during processing incoming email: %s" msg)
-          in
-          begin match (hdrs, dmarc) with
-          | Ok hdrs, Ok dmarc ->
-              let receiver = receiver ~info:sinfo in
-              let arc_authentication_results =
-                let uid = succ (last_arc_set hdrs) in
-                let encoder = Arc.Encoder.stamp_results ~receiver ~uid in
-                Prettym.to_string ~new_line:"\r\n" encoder dmarc
-              in
-              let authentication_results =
-                let encoder = aresults ~receiver in
-                Prettym.to_string ~new_line:"\r\n" encoder dmarc
-              in
-              let v = (arc_authentication_results, authentication_results) in
-              List.iter (fn v) rcpts
-          | _, Error err -> Logs.err (fun m -> m "DMARC error: %a" pp_error err)
-          | Error err, _ ->
-              Logs.err (fun m -> m "Invalid incoming email: %a" pp_error err)
-          end
-        end
+    | m when forward -> Outgoing.handler ~cfg ~info resolver m oc q v
+    | m -> Incoming.handler ~cfg ~info peer m oc q v
     | exception Ptt.Recipients_unreachable ->
         Logs.err (fun m -> m "Given recipients are unreachable")
     | exception Ptt.Quit ->
@@ -335,7 +359,23 @@ let rec clean_up orphans =
 
 let _5s = 5_000_000_000
 
+let expired certs =
+  let fn than cert =
+    let _, not_after = X509.Certificate.validity cert in
+    if Ptime.is_earlier not_after ~than then not_after else than
+  in
+  let now = Mirage_ptime.now () in
+  let not_after = List.fold_left fn now certs in
+  Ptime.is_earlier not_after ~than:now
+
+let not_expired = Fun.negate expired
+
 let server ~cfg ~info tcp dns_key ~hostname ~key_seed (dns_ip, dns_port) =
+  (* This code is primarily used to request and obtain a TLS certificate from
+     our primary DNS server. It manages the certificate’s expiry. Client
+     management is never interrupted, even during a renegotiation. We allow five
+     seconds before the certificate actually expires to initiate the new
+     renegotiation. *)
   let listen = Mnet.TCP.listen tcp 25 in
   let mutex = Miou.Mutex.create () in
   let condition = Miou.Condition.create () in
@@ -345,11 +385,11 @@ let server ~cfg ~info tcp dns_key ~hostname ~key_seed (dns_ip, dns_port) =
     let () =
       Miou.Mutex.protect mutex @@ fun () ->
       Queue.push flow shared;
-      Miou.Condition.broadcast condition
+      Miou.Condition.signal condition
     in
     filler ()
   in
-  let rec go () =
+  let rec go orphans =
     match
       Cert.retrieve_certificate tcp dns_key ~hostname ~key_seed dns_ip dns_port
     with
@@ -364,37 +404,48 @@ let server ~cfg ~info tcp dns_key ~hostname ~key_seed (dns_ip, dns_port) =
         let tls = Result.get_ok tls in
         let info = ({ (fst info) with Ptt.tls= Some tls }, snd info) in
         let handler = handler ~cfg ~info in
-        let rec clients orphans =
+        let server = Miou.async @@ fun () -> filler () in
+        let signal =
+          Miou.async @@ fun () ->
+          let now = Mirage_ptime.now () in
+          let remaining = Ptime.diff not_after now in
+          let secs = Ptime.Span.to_int_s remaining |> Option.value ~default:0 in
+          let nsec = secs * 1_000_000_000 in
+          let v = Int.max 0 (nsec - _5s) in
+          Logs.debug (fun m -> m "Wait %a" Duration.pp (Int64.of_int v));
+          Mkernel.sleep v;
+          Miou.Mutex.protect mutex @@ fun () -> Miou.Condition.signal condition
+        in
+        let rec until_expiration orphans =
           clean_up orphans;
-          let flows =
+          let state =
             Miou.Mutex.protect mutex @@ fun () ->
-            while Queue.is_empty shared do
+            while Queue.is_empty shared && not_expired certs do
               Miou.Condition.wait condition mutex
             done;
-            let flows = List.of_seq (Queue.to_seq shared) in
-            Queue.clear shared; flows
+            if expired certs then `Expired
+            else begin
+              let flows = List.of_seq (Queue.to_seq shared) in
+              Queue.clear shared; `Clients flows
+            end
           in
-          let fn flow =
-            let _, (peer, port) = Mnet.TCP.peers flow in
-            Logs.debug (fun m ->
-                m "Got a new connection from %a:%d" Ipaddr.pp peer port);
-            ignore (Miou.async ~orphans @@ fun () -> handler flow)
-          in
-          List.iter fn flows; clients orphans
+          match state with
+          | `Expired ->
+              Logs.info (fun m -> m "Certificate expiring, renewing...");
+              Miou.await_exn signal;
+              Miou.cancel server
+          | `Clients flows ->
+              let fn flow =
+                let _, (peer, port) = Mnet.TCP.peers flow in
+                Logs.debug (fun m ->
+                    m "Got a new connection from %a:%d" Ipaddr.pp peer port);
+                ignore (Miou.async ~orphans @@ fun () -> handler flow)
+              in
+              List.iter fn flows; until_expiration orphans
         in
-        let server = Miou.async @@ fun () -> filler () in
-        let worker = Miou.async @@ fun () -> clients (Miou.orphans ()) in
-        let now = Mirage_ptime.now () in
-        let remaining = Ptime.diff not_after now in
-        let secs = Ptime.Span.to_int_s remaining |> Option.value ~default:0 in
-        let nsec = secs * 1_000_000_000 in
-        Mkernel.sleep (Int.max 0 (nsec - _5s));
-        Logs.info (fun m -> m "Certificate expiring, renewing...");
-        Miou.cancel server;
-        Miou.cancel worker;
-        go ()
+        until_expiration orphans; go orphans
   in
-  go ()
+  go (Miou.orphans ())
 
 let fat ~name =
   let fn blk () =
@@ -492,7 +543,8 @@ let run _ (cidrv4, gateway, ipv6) info nameservers forward_granted_for to_arc
     let fn = Ipaddr.Prefix.mem ipaddr in
     List.exists fn forward_granted_for
   in
-  let cfg = { forward; pool; dns; client; lists; to_arc; to_dkim } in
+  let bounces = Bounces.create () in
+  let cfg = { forward; pool; dns; client; lists; bounces; to_arc; to_dkim } in
   server ~cfg ~info tcp dns_key ~hostname ~key_seed cert_dns
 
 open Cmdliner
