@@ -41,15 +41,32 @@ type cfg = {
   ; bounces: Bounces.t
   ; to_arc: Ipaddr.t
   ; to_dkim: Ipaddr.t
+  ; admin: (Emile.local option * Colombe.Forward_path.t) option
 }
 
-let is_us { Colombe.Path.domain; _ } domain' =
-  Colombe.Domain.equal domain domain'
+let is_us domain info = Colombe.Domain.equal domain info.Ptt.domain
 
-let is_for_an_existing_mailing_list ({ Colombe.Path.local; _ } as fp) lsts =
-  let local = Colombe.Path.Encoder.local_to_string local in
-  let local = List.hd (String.split_on_char '-' local) in
-  match S.find_opt local lsts with Some lst -> Some (lst, fp) | None -> None
+let is_for_an_existing_mailing_list fp info cfg =
+  match fp with
+  | Colombe.Forward_path.Postmaster -> None
+  | Domain _ -> None
+  | Forward_path ({ local; domain; rest= [] } as path) when is_us domain info ->
+      let local = Colombe.Path.Encoder.local_to_string local in
+      let local = List.hd (String.split_on_char '-' local) in
+      let fn list = (list, path) in
+      Option.map fn (S.find_opt local cfg.lists)
+  | _ -> None
+
+let is_admin fp info cfg =
+  match (cfg.admin, fp) with
+  | None, _ -> None
+  | Some (_, rcpt), Colombe.Forward_path.Postmaster -> Some rcpt
+  | Some (_, rcpt), Domain domain when is_us domain info -> Some rcpt
+  | Some (Some local', rcpt), Forward_path { local; domain; rest= [] } ->
+      let local = Colombe_emile.of_local local in
+      if is_us domain info && Emile.equal_local local local' then Some rcpt
+      else None
+  | _ -> None
 
 module Incoming = struct
   let aresults ~receiver ppf =
@@ -139,18 +156,18 @@ module Incoming = struct
     let src = Flux.Source.bqueue q in
     let stream = Flux.Stream.from src in
     let from = fst m.Ptt.from in
-    let rcpts =
+    let rcpts, to_lists =
       let fn (fp, _) =
-        match fp with
-        | Colombe.Forward_path.Forward_path path ->
-            if is_us path sinfo.Ptt.domain then
-              is_for_an_existing_mailing_list path cfg.lists
-            else None
-        | _ -> None
+        match is_admin fp sinfo cfg with
+        | None ->
+            Option.map Either.right
+              (is_for_an_existing_mailing_list fp sinfo cfg)
+        | Some admin -> Some (Either.Left admin)
       in
-      List.filter_map fn m.Ptt.recipients
+      let rcpts = List.filter_map fn m.Ptt.recipients in
+      List.partition_map Fun.id rcpts
     in
-    if not (List.is_empty rcpts) then begin
+    if List.is_empty rcpts = false || List.is_empty to_lists = false then begin
       let ctx = Uspf.empty in
       let ctx = Uspf.with_ip peer ctx in
       let ctx =
@@ -169,21 +186,36 @@ module Incoming = struct
       Logs.debug (fun m ->
           let hash = Digestif.SHA256.digest_bigstring bstr in
           m "Incoming email: %a" Digestif.SHA256.pp hash);
-      let fn (arc, dkim) (lst, rcpt) =
+      let with_list (arc_aresults, aresults) (lst, rcpt) =
         match Mlm.incoming lst cfg.bounces ~from ~rcpt bstr with
         | Ok (lst', outgoing0, outgoing1) ->
             let info = cinfo in
             let client = cfg.client in
-            let dst = cfg.to_arc in
-            let aresults = arc in
-            let lst' = send_locally client ~info ~aresults lst' dst outgoing0 in
             let dst = cfg.to_dkim in
-            let aresults = dkim in
             let lst' = send_locally client ~info ~aresults lst' dst outgoing1 in
+            let dst = cfg.to_arc in
+            let aresults = arc_aresults in
+            let lst' = send_locally client ~info ~aresults lst' dst outgoing0 in
             cfg.lists <- S.add (Mlm.name lst') lst' cfg.lists
         | Error (`Msg msg) ->
             Logs.err (fun m ->
                 m "Error during processing incoming email: %s" msg)
+      in
+      let for_admin arc_aresults rcpt =
+        let seq =
+          Seq.forever @@ fun () ->
+          let arc_aresults = Flux.Source.list [ arc_aresults ] in
+          let arc_aresults = Flux.Stream.from arc_aresults in
+          let stream = Flux.Stream.from (from_bstr bstr) in
+          Flux.Stream.concat arc_aresults stream
+        in
+        let from = fst m.Ptt.from
+        and rcpts = [ rcpt ]
+        and info = cinfo
+        and client = cfg.client
+        and resolver = static cfg.to_arc in
+        let _errs = Facteur.sendmail client ~info resolver ~from rcpts seq in
+        ()
       in
       begin match (hdrs, dmarc) with
       | Ok hdrs, Ok dmarc ->
@@ -197,8 +229,9 @@ module Incoming = struct
             let encoder = aresults ~receiver in
             Prettym.to_string ~new_line:"\r\n" encoder dmarc
           in
-          let v = (arc_authentication_results, authentication_results) in
-          List.iter (fn v) rcpts
+          let aresults = (arc_authentication_results, authentication_results) in
+          List.iter (with_list aresults) to_lists;
+          List.iter (for_admin arc_authentication_results) rcpts
       | _, Error err -> Logs.err (fun m -> m "DMARC error: %a" pp_error err)
       | Error err, _ ->
           Logs.err (fun m -> m "Invalid incoming email: %a" pp_error err)
@@ -232,14 +265,9 @@ module Outgoing = struct
     let stream = Flux.Stream.from from in
     let mrcpts, rcpts =
       let fn (fp, _) =
-        match fp with
-        | Colombe.Forward_path.Forward_path path ->
-            if is_us path sinfo.Ptt.domain then
-              match is_for_an_existing_mailing_list path cfg.lists with
-              | Some (lst, fp) -> Either.Left (lst, fp)
-              | None -> Either.Right fp
-            else Either.Right fp
-        | _ -> Either.Right fp
+        match is_for_an_existing_mailing_list fp sinfo cfg with
+        | Some (lst, fp) -> Either.Left (lst, fp)
+        | None -> Either.Right fp
       in
       List.partition_map fn m.Ptt.recipients
     in
@@ -498,7 +526,7 @@ let lists ~info fs =
   Ok m
 
 let run _ (cidrv4, gateway, ipv6) info nameservers forward_granted_for to_arc
-    to_dkim cert =
+    to_dkim cert admin =
   let hostname, cert_dns, dns_key, key_seed = cert in
   let devices =
     let open Mkernel in
@@ -543,8 +571,33 @@ let run _ (cidrv4, gateway, ipv6) info nameservers forward_granted_for to_arc
     let fn = Ipaddr.Prefix.mem ipaddr in
     List.exists fn forward_granted_for
   in
-  let bounces = Bounces.create () in
-  let cfg = { forward; pool; dns; client; lists; bounces; to_arc; to_dkim } in
+  let bounces =
+    let rec jsont = lazy (Bounces.json ~store ())
+    and store t =
+      let str = Jsont_bytesrw.encode_string (Lazy.force jsont) t in
+      let str = Result.get_ok str in
+      let process () =
+        (* TODO(dinosaure): should be an atomic operation (power failure). *)
+        let _ = Fat.remove fs "bounces.json" in
+        Fat.write fs "bounces.json" str
+      in
+      match process () with
+      | Ok () -> ()
+      | Error (`Msg msg) ->
+          Logs.err (fun m -> m "Error during saving bounces state: %s" msg)
+    in
+    let process () =
+      let* contents = Fat.read fs "bounces.json" in
+      let jsont = Lazy.force jsont in
+      Jsont_bytesrw.decode_string jsont contents |> Result.map_error msg
+    in
+    match process () with
+    | Ok bounces -> bounces
+    | _ -> Bounces.create ~store ()
+  in
+  let cfg =
+    { forward; pool; dns; client; lists; bounces; to_arc; to_dkim; admin }
+  in
   server ~cfg ~info tcp dns_key ~hostname ~key_seed cert_dns
 
 open Cmdliner
@@ -714,6 +767,47 @@ let setup_cert =
   in
   term_result term
 
+let admin =
+  let parser str =
+    match String.split_on_char ':' str with
+    | [ addr ] -> begin
+        let fn m = (None, Colombe_emile.to_forward_path m) in
+        Result.map fn (Emile.of_string addr)
+        |> Result.map_error @@ function
+           | `Msg _ as err -> err
+           | `Invalid _ -> msgf "Invalid email: %S" addr
+      end
+    | local :: addr ->
+        let addr = String.concat ":" addr in
+        begin match (Emile.of_string addr, Mlm.local_of_string local) with
+        | Ok mailbox, Ok local ->
+            let local = Colombe_emile.of_local local in
+            let forward_path = Colombe_emile.to_forward_path mailbox in
+            Ok (Some local, forward_path)
+        | Ok mailbox, Error _ ->
+            let forward_path = Colombe_emile.to_forward_path mailbox in
+            Ok (None, forward_path)
+        | _ -> error_msgf "Impossible to parse %S as a email address" str
+        end
+    | [] -> assert false
+  in
+  (* NOTE(dinosaure): the [Option.get] should be safe because we don't try to
+     encode [Postmaster] and/or [Domain]. *)
+  let pp ppf = function
+    | None, mailbox ->
+        let mailbox = Colombe_emile.of_forward_path mailbox in
+        let mailbox = Option.get mailbox in
+        Fmt.string ppf (Emile.to_string mailbox)
+    | Some local, mailbox ->
+        let mailbox = Colombe_emile.of_forward_path mailbox in
+        let mailbox = Option.get mailbox in
+        Fmt.pf ppf "%s:%s" (Mlm.local_to_string local) (Emile.to_string mailbox)
+  in
+  let admin = Arg.conv (parser, pp) in
+  let doc = "Email address to send administrative emails." in
+  let open Arg in
+  value & opt (some admin) None & info [ "admin" ] ~doc ~docv:"[LOCAL:]EMAIL"
+
 let term =
   let open Term in
   const run
@@ -725,6 +819,7 @@ let term =
   $ destination
   $ submission_destination
   $ setup_cert
+  $ admin
 
 let cmd =
   let info = Cmd.info "lipap" ~doc:"Mailing list manager unikernel" in
