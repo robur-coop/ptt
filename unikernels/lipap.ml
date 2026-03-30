@@ -561,12 +561,11 @@ let run _ (cidrv4, gateway, ipv6) info nameservers forward_granted_for to_arc
   in
   let lists =
     match lists ~info:sinfo fs with
-    | Ok _ as value -> value
+    | Ok value -> value
     | Error (`Msg msg) as err ->
         Logs.err (fun m -> m "Impossible to read our state: %s" msg);
-        err
+        S.empty
   in
-  let lists = Result.value ~default:S.empty lists in
   let forward ipaddr =
     let fn = Ipaddr.Prefix.mem ipaddr in
     List.exists fn forward_granted_for

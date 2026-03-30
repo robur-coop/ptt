@@ -23,30 +23,6 @@ type t = {
   ; store: t -> unit
 }
 
-(*
-
-  let failures =
-    let fn k v m = S.add (Colombe.Path.Encoder.to_string k) v m in
-    Hashtbl.fold fn t.failures S.empty in
-  let possibly_fixed =
-    let fn k v m = S.add (Colombe.Path.Encore.to_string k) v m in
-    Cache.fold fn S.empty t.possibly_fixed in
-  let open Jsont in
-  let fn m0 m1 = (m0, m1) in
-    let failures = Hashtbl.create 0x7ff in
-    let possibly_fixed = Cache.create 0x7ff in
-    let fn path attempts =
-      let path = Colombe.Path.of_string_exn path in
-      Hashtbl.replace failures path attempts in
-    S.iter fn m0;
-    let fn path { expire_at; attempts } =
-      if not (Ptime.is_earlier expire_at ~than:now)
-      then Cache.add path value possibly_fixed in
-    { failures; possibly_fixed } in
-
-
- *)
-
 let rfc3339 =
   let dec str =
     match Ptime.of_rfc3339 str with
@@ -106,13 +82,16 @@ let failure_for t ~counter path =
   | Some attempts when List.length attempts < 3 ->
       let attempts = List.sort_uniq Int.compare (counter :: attempts) in
       Hashtbl.replace t.failures path attempts;
+      t.store t;
       None
   | Some _ ->
       Log.debug (fun m -> m "Too many failures for: %a" Colombe.Path.pp path);
       Hashtbl.remove t.failures path;
+      t.store t;
       Some path
   | None ->
       Hashtbl.add t.failures path [ counter ];
+      t.store t;
       None
 
 let _15m = Ptime.Span.of_int_s 900
@@ -129,7 +108,8 @@ let success_for t ~counter path =
       let expire_at = Option.get expire_at in
       let attempts = List.sort_uniq Int.compare (counter :: attempts) in
       Hashtbl.remove t.failures path;
-      Cache.add path { expire_at; attempts } t.possibly_fixed
+      Cache.add path { expire_at; attempts } t.possibly_fixed;
+      t.store t
 
 let rec clean_up t =
   let than = Mirage_ptime.now () in
@@ -147,7 +127,8 @@ let signaled_for t ~counter path =
       let attempts = List.sort_uniq Int.compare (counter :: attempts) in
       Log.debug (fun m -> m "%a failed, re-add it" Colombe.Path.pp path);
       Hashtbl.replace t.failures path attempts;
-      Cache.remove path t.possibly_fixed
+      Cache.remove path t.possibly_fixed;
+      t.store t
   | None ->
       begin match Hashtbl.find_opt t.failures path with
       | Some attempts when List.length attempts < 3 ->
@@ -159,4 +140,5 @@ let signaled_for t ~counter path =
           let attempts = List.drop (len - 3) attempts in
           Hashtbl.replace t.failures path attempts
       | None -> Hashtbl.add t.failures path [ counter ]
-      end
+      end;
+      t.store t
