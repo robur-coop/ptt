@@ -188,15 +188,15 @@ module Incoming = struct
           m "Incoming email: %a" Digestif.SHA256.pp hash);
       let with_list (arc_aresults, aresults) (lst, rcpt) =
         match Mlm.incoming lst cfg.bounces ~from ~rcpt bstr with
-        | Ok (lst', outgoing0, outgoing1) ->
+        | Ok (lst, outgoing0, outgoing1) ->
             let info = cinfo in
             let client = cfg.client in
             let dst = cfg.to_dkim in
-            let lst' = send_locally client ~info ~aresults lst' dst outgoing1 in
+            let lst = send_locally client ~info ~aresults lst dst outgoing1 in
             let dst = cfg.to_arc in
             let aresults = arc_aresults in
-            let lst' = send_locally client ~info ~aresults lst' dst outgoing0 in
-            cfg.lists <- S.add (Mlm.name lst') lst' cfg.lists
+            let lst = send_locally client ~info ~aresults lst dst outgoing0 in
+            Mlm.save lst
         | Error (`Msg msg) ->
             Logs.err (fun m ->
                 m "Error during processing incoming email: %s" msg)
@@ -240,7 +240,7 @@ module Incoming = struct
 end
 
 module Outgoing = struct
-  let broadcast cfg client ~info resolver _lst ~counter txs seq =
+  let broadcast cfg client ~info resolver lst ~counter txs seq =
     let fn { Mlm.sender; recipient } = (sender, recipient) in
     let txs = List.map fn txs in
     let results = Facteur.broadcast client ~info resolver txs seq in
@@ -256,8 +256,11 @@ module Outgoing = struct
           None
       | _ -> None
     in
-    let _to_delete = List.filter_map fn results in
-    ()
+    let to_delete = List.filter_map fn results in
+    let fn subscriber = List.exists (Colombe.Path.equal subscriber) to_delete in
+    let fn = Fun.negate fn in
+    let subscribers = List.filter fn (Mlm.subscribers lst) in
+    Mlm.with_subscribers lst subscribers
 
   let handler ~cfg ~info:(sinfo, cinfo) resolver m oc q v =
     assert (Miou.Computation.try_return oc `Ok);
@@ -276,10 +279,11 @@ module Outgoing = struct
     let from = fst m.Ptt.from in
     let fn (lst, rcpt) =
       match Mlm.outgoing lst ~from ~rcpt with
-      | Ok (lst', counter, txs) ->
+      | Ok (lst, counter, txs) ->
           let info = cinfo in
           let client = cfg.client in
-          broadcast cfg client ~info resolver lst' ~counter txs seq
+          let lst = broadcast cfg client ~info resolver lst ~counter txs seq in
+          Mlm.save lst
       | Error (`Msg msg) ->
           Logs.err (fun m ->
               m "Error during processing incoming email (local network): %s" msg)
@@ -483,7 +487,7 @@ let fat ~name =
   in
   Mkernel.map fn [ Mkernel.block name ]
 
-let lists ~info fs =
+let lists ~cfg ~info fs =
   let* entries = Fat.ls fs "lists" in
   Logs.debug (fun m -> m "%d possible mailing lists" (List.length entries));
   let fn acc = function
@@ -501,7 +505,9 @@ let lists ~info fs =
             let process () =
               (* TODO(dinosaure): should be an atomic operation (power failure). *)
               let* () = Fat.remove fs ("lists" / filepath) in
-              Fat.write fs ("lists" / filepath) str
+              let* () = Fat.write fs ("lists" / filepath) str in
+              cfg.lists <- S.add (Mlm.name t) t cfg.lists;
+              Ok ()
             in
             match process () with
             | Ok () -> ()
@@ -559,13 +565,6 @@ let run _ (cidrv4, gateway, ipv6) info nameservers forward_granted_for to_arc
     in
     { Facteur.he; pool }
   in
-  let lists =
-    match lists ~info:sinfo fs with
-    | Ok value -> value
-    | Error (`Msg msg) as err ->
-        Logs.err (fun m -> m "Impossible to read our state: %s" msg);
-        S.empty
-  in
   let forward ipaddr =
     let fn = Ipaddr.Prefix.mem ipaddr in
     List.exists fn forward_granted_for
@@ -595,8 +594,35 @@ let run _ (cidrv4, gateway, ipv6) info nameservers forward_granted_for to_arc
     | _ -> Bounces.create ~store ()
   in
   let cfg =
-    { forward; pool; dns; client; lists; bounces; to_arc; to_dkim; admin }
+    {
+      forward
+    ; pool
+    ; dns
+    ; client
+    ; lists= S.empty
+    ; bounces
+    ; to_arc
+    ; to_dkim
+    ; admin
+    }
   in
+  (* NOTE(dinosaure): we must create a [cfg] with an empty [lists]. It's a
+     mutable. Then we use this mutable to update [cfg.lists] when we use
+     [Mlm.save] (and call the [store] function which saves the state of the list
+     into our file system but also set [cfg.lists]). Finally, we set [cfg.lists]
+     with all the lists we retrieved.
+
+     The pattern is a bit unusual but really helpful when it's about the state
+     of our list and how we persistently save/keep it regardless the file system
+     and our mutable [cfg.lists] value. *)
+  let lists =
+    match lists ~cfg ~info:sinfo fs with
+    | Ok value -> value
+    | Error (`Msg msg) ->
+        Logs.err (fun m -> m "Impossible to read our state: %s" msg);
+        S.empty
+  in
+  cfg.lists <- lists;
   server ~cfg ~info tcp dns_key ~hostname ~key_seed cert_dns
 
 open Cmdliner

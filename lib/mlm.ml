@@ -119,9 +119,6 @@ let make ~domain name =
   ; store= ignore
   }
 
-let name t = local_to_string t.name
-let domain t = t.domain
-
 let is_moderator ~from t =
   match from with
   | None -> false
@@ -605,3 +602,9 @@ let incoming t bounces ~from ~rcpt:({ Colombe.Path.local; _ } as rcpt) bstr =
           m "Ignoring email from %a" Colombe.Reverse_path.pp from);
       Ok (t, [], [])
   end
+
+let name t = local_to_string t.name
+let domain t = t.domain
+let subscribers t = t.subscribers
+let with_subscribers t subscribers = { t with subscribers }
+let save t = t.store t

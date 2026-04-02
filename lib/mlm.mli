@@ -42,6 +42,9 @@ val json :
 
 val name : t -> string
 val domain : t -> Colombe.Domain.t
+val subscribers : t -> Colombe.Path.t list
+val with_subscribers : t -> Colombe.Path.t list -> t
+val save : t -> unit
 
 type outgoing = {
     sender: Colombe.Reverse_path.t
