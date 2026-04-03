@@ -39,6 +39,7 @@ type cfg = {
   ; client: Facteur.t
   ; mutable lists: Mlm.t S.t
   ; bounces: Bounces.t
+  ; temp: Blk.t Mfat.t Temp.t
   ; to_arc: Ipaddr.t
   ; to_dkim: Ipaddr.t
   ; admin: (Emile.local option * Colombe.Forward_path.t) option
@@ -244,14 +245,21 @@ module Outgoing = struct
     let fn { Mlm.sender; recipient } = (sender, recipient) in
     let txs = List.map fn txs in
     let results = Facteur.broadcast client ~info resolver txs seq in
-    let fn (_domain, fp, result) =
-      match (result, fp) with
-      | Error err, Colombe.Forward_path.Forward_path fp ->
+    let fn (_domain, rp, fp, result) =
+      match (result, rp, fp) with
+      | ( Error (`Temporary_failure `Error_processing)
+        , Some from
+        , Colombe.Forward_path.Forward_path fp ) ->
+          let[@warning "-8"] (Some (stream, _)) = Seq.uncons seq in
+          let str = Flux.Stream.into Flux.Sink.string stream in
+          Temp.add_new_failure cfg.temp ~counter ~from fp str;
+          None
+      | Error err, _, Colombe.Forward_path.Forward_path fp ->
           Logs.err (fun m ->
               m "Impossible to send an email to %a: %a" Colombe.Path.pp fp
                 Facteur.pp_error err);
           Bounces.failure_for cfg.bounces ~counter fp
-      | Ok (), Colombe.Forward_path.Forward_path fp ->
+      | Ok (), _, Colombe.Forward_path.Forward_path fp ->
           Bounces.success_for cfg.bounces ~counter fp;
           None
       | _ -> None
@@ -294,7 +302,7 @@ module Outgoing = struct
     let fn rcpt = (fst m.Ptt.from, rcpt) in
     let txs = List.map fn rcpts in
     let errs = Facteur.broadcast client ~info resolver txs seq in
-    let fn (_domain, fp, result) =
+    let fn (_domain, _rp, fp, result) =
       match result with
       | Ok () -> ()
       | Error err ->
@@ -305,25 +313,26 @@ module Outgoing = struct
     List.iter fn errs
 end
 
+let resolver_from_dns dns =
+  let gethostbyname dns domain_name =
+    let ipv4 = Mnet_dns.gethostbyname dns domain_name in
+    let ipv6 = Mnet_dns.gethostbyname6 dns domain_name in
+    match (ipv4, ipv6) with
+    | Ok ipv4, Ok ipv6 -> Ok [ Ipaddr.V4 ipv4; Ipaddr.V6 ipv6 ]
+    | Ok ipv4, Error _ -> Ok [ Ipaddr.V4 ipv4 ]
+    | Error _, Ok ipv6 -> Ok [ Ipaddr.V6 ipv6 ]
+    | (Error _ as err), _ -> err
+  in
+  let getmxbyname dns domain_name =
+    let* _ttl, mxs = Mnet_dns.getaddrinfo dns Dns.Rr_map.Mx domain_name in
+    Ok mxs
+  in
+  Ptt.Resolver { gethostbyname; getmxbyname; dns }
+
 let resolver_according_to_peer ~cfg static flow =
   let _, (peer, _) = Mnet.TCP.peers flow in
   match cfg.forward peer with
-  | true ->
-      let dns = cfg.dns in
-      let gethostbyname dns domain_name =
-        let ipv4 = Mnet_dns.gethostbyname dns domain_name in
-        let ipv6 = Mnet_dns.gethostbyname6 dns domain_name in
-        match (ipv4, ipv6) with
-        | Ok ipv4, Ok ipv6 -> Ok [ Ipaddr.V4 ipv4; Ipaddr.V6 ipv6 ]
-        | Ok ipv4, Error _ -> Ok [ Ipaddr.V4 ipv4 ]
-        | Error _, Ok ipv6 -> Ok [ Ipaddr.V6 ipv6 ]
-        | (Error _ as err), _ -> err
-      in
-      let getmxbyname dns domain_name =
-        let* _ttl, mxs = Mnet_dns.getaddrinfo dns Dns.Rr_map.Mx domain_name in
-        Ok mxs
-      in
-      Ptt.Resolver { gethostbyname; getmxbyname; dns }
+  | true -> resolver_from_dns cfg.dns
   | false ->
       let gethostbyname ipaddrs _ = Result.ok ipaddrs
       and getmxbyname _ mail_exchange =
@@ -531,6 +540,78 @@ let lists ~cfg ~info fs =
   let m = List.fold_left fn S.empty entries in
   Ok m
 
+let bounces fs =
+  let rec jsont = lazy (Bounces.json ~store ())
+  and store t =
+    let str = Jsont_bytesrw.encode_string (Lazy.force jsont) t in
+    let str = Result.get_ok str in
+    let process () =
+      (* TODO(dinosaure): should be an atomic operation (power failure). *)
+      let _ = Fat.remove fs "bounces.json" in
+      Fat.write fs "bounces.json" str
+    in
+    match process () with
+    | Ok () -> ()
+    | Error (`Msg msg) ->
+        Logs.err (fun m -> m "Error during saving bounces state: %s" msg)
+  in
+  let process () =
+    let* contents = Fat.read fs "bounces.json" in
+    let jsont = Lazy.force jsont in
+    Jsont_bytesrw.decode_string jsont contents |> Result.map_error msg
+  in
+  match process () with Ok bounces -> bounces | _ -> Bounces.create ~store ()
+
+let temp ~info client resolver fs bounces =
+  let msgID_to_string (local, (domain : Mrmime.MessageID.domain)) =
+    let domain = (domain :> Emile.domain) in
+    let mailbox = { Emile.name= None; local; domain= (domain, []) } in
+    Emile.to_string mailbox
+  in
+  let add fs msgID str =
+    let path = "tmp" / msgID_to_string msgID in
+    match Fat.write fs path str with
+    | Ok () -> ()
+    | Error (`Msg msg) ->
+        Logs.warn (fun m -> m "Impossible to write %s: %s" path msg)
+  in
+  let rem fs msgID =
+    let path = "tmp" / msgID_to_string msgID in
+    ignore (Fat.remove fs path)
+  in
+  let get fs msgID =
+    let path = "tmp" / msgID_to_string msgID in
+    match Fat.read fs path with
+    | Ok str -> str
+    | Error (`Msg msg) -> Fmt.failwith "%s does not exist: %s" path msg
+  in
+  let action = { Temp.get; rem; add } in
+  let rec jsont =
+    lazy (Temp.json ~info ~store client resolver fs action bounces)
+  and store t =
+    let str = Jsont_bytesrw.encode_string (Lazy.force jsont) t in
+    let str = Result.get_ok str in
+    let process () =
+      (* TODO(dinosaure): should be an atomic operation (power failure). *)
+      let _ = Fat.remove fs "temp.json" in
+      Fat.write fs "temp.json" str
+    in
+    match process () with
+    | Ok () -> ()
+    | Error (`Msg msg) ->
+        Logs.err (fun m -> m "Error during saving temp state: %s" msg)
+  in
+  let process () =
+    (* NOTE(dinosaure): ensure that we have [tmp/]. *)
+    ignore (Fat.mkdir fs "tmp");
+    let* contents = Fat.read fs "temp.json" in
+    let jsont = Lazy.force jsont in
+    Jsont_bytesrw.decode_string jsont contents |> Result.map_error msg
+  in
+  match process () with
+  | Ok tmp -> tmp
+  | Error _ -> Temp.create ~info ~store client resolver fs action bounces
+
 let run _ (cidrv4, gateway, ipv6) info nameservers forward_granted_for to_arc
     to_dkim cert admin =
   let hostname, cert_dns, dns_key, key_seed = cert in
@@ -569,30 +650,14 @@ let run _ (cidrv4, gateway, ipv6) info nameservers forward_granted_for to_arc
     let fn = Ipaddr.Prefix.mem ipaddr in
     List.exists fn forward_granted_for
   in
-  let bounces =
-    let rec jsont = lazy (Bounces.json ~store ())
-    and store t =
-      let str = Jsont_bytesrw.encode_string (Lazy.force jsont) t in
-      let str = Result.get_ok str in
-      let process () =
-        (* TODO(dinosaure): should be an atomic operation (power failure). *)
-        let _ = Fat.remove fs "bounces.json" in
-        Fat.write fs "bounces.json" str
-      in
-      match process () with
-      | Ok () -> ()
-      | Error (`Msg msg) ->
-          Logs.err (fun m -> m "Error during saving bounces state: %s" msg)
-    in
-    let process () =
-      let* contents = Fat.read fs "bounces.json" in
-      let jsont = Lazy.force jsont in
-      Jsont_bytesrw.decode_string jsont contents |> Result.map_error msg
-    in
-    match process () with
-    | Ok bounces -> bounces
-    | _ -> Bounces.create ~store ()
+  let bounces = bounces fs in
+  let temp, tempd =
+    let resolver = resolver_from_dns dns in
+    let temp = temp ~info:(snd info) client resolver fs bounces in
+    let tempd = Miou.async @@ fun () -> Temp.launch temp in
+    (temp, tempd)
   in
+  let@ () = fun () -> Miou.cancel tempd in
   let cfg =
     {
       forward
@@ -601,6 +666,7 @@ let run _ (cidrv4, gateway, ipv6) info nameservers forward_granted_for to_arc
     ; client
     ; lists= S.empty
     ; bounces
+    ; temp
     ; to_arc
     ; to_dkim
     ; admin

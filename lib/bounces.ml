@@ -94,6 +94,16 @@ let failure_for t ~counter path =
       t.store t;
       None
 
+let failure_for_without_deletion t ~counter path =
+  match Hashtbl.find_opt t.failures path with
+  | Some attempts ->
+      let attempts = List.sort_uniq Int.compare (counter :: attempts) in
+      Hashtbl.replace t.failures path attempts;
+      t.store t
+  | None ->
+      Hashtbl.add t.failures path [ counter ];
+      t.store t
+
 let _15m = Ptime.Span.of_int_s 900
 
 let success_for t ~counter path =

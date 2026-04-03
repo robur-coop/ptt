@@ -58,7 +58,10 @@ val many :
   -> destination:Colombe.Domain.t
   -> (Colombe.Reverse_path.t * Colombe.Forward_path.t) list
   -> string Flux.stream Seq.t
-  -> ((Colombe.Forward_path.t * (unit, error) result) list, error) result
+  -> ( (Colombe.Reverse_path.t * Colombe.Forward_path.t * (unit, error) result)
+       list
+     , error )
+     result
 (** [many t ~info resolver ~destination txs email] sends multiple transactions
     [txs] to the same [destination] domain within a single SMTP session. Each
     transaction is a [(from, recipients)] pair.
@@ -81,7 +84,11 @@ val broadcast :
   -> Ptt.resolver
   -> (Colombe.Reverse_path.t * Colombe.Forward_path.t) list
   -> string Flux.stream Seq.t
-  -> (Colombe.Domain.t * Colombe.Forward_path.t * (unit, error) result) list
+  -> (Colombe.Domain.t
+     * Colombe.Reverse_path.t
+     * Colombe.Forward_path.t
+     * (unit, error) result)
+     list
 (** [broadcast t ~info resolver ~from recipients email] sends [email] from
     [from] to [recipients], grouped by destination domain, with each domain
     delivered concurrently. Unlike {!sendmail} which groups by

@@ -167,8 +167,10 @@ let many t ~info resolver ~destination:domain txs seq =
           Msendmail.many ~encoder ~decoder ~queue t.he ~destination:dst
             ~domain:info.domain ?cfg:info.tls txs seq
         in
-        let fn (fp, result) =
-          (fp, Result.map_error (fun err -> (err :> error)) result)
+        let fn (rp, fp, result) =
+          let fn err = (err :> error) in
+          let result = Result.map_error fn result in
+          (rp, fp, result)
         in
         Ok (List.map fn results)
     | (_mx, ipaddrs) :: mxs -> begin
@@ -183,8 +185,10 @@ let many t ~info resolver ~destination:domain txs seq =
         in
         match result with
         | Ok results ->
-            let fn (fp, result) =
-              (fp, Result.map_error (fun err -> (err :> error)) result)
+            let fn (rp, fp, result) =
+              let fn err = (err :> error) in
+              let result = Result.map_error fn result in
+              (rp, fp, result)
             in
             Ok (List.map fn results)
         | Error err ->
@@ -227,7 +231,7 @@ let broadcast t ~info resolver txs seq =
     | Error _exn -> []
     | Ok (_, Error _err) -> []
     | Ok (destination, Ok results) ->
-        let fn (fp, result) = (destination, fp, result) in
+        let fn (rp, fp, result) = (destination, rp, fp, result) in
         List.map fn results
   in
   List.map fn results |> List.flatten
