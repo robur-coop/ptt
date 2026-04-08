@@ -270,7 +270,7 @@ let wait t =
   in
   match Cache.fold fn None t.entries with
   | None ->
-      Log.debug (fun m -> m "Wait 15m");
+      Log.debug (fun m -> m "Wait 15m (no mails)");
       Mkernel.sleep 900_000_000_000 (* 15m *)
   | Some b ->
       let a = Mirage_ptime.now () in

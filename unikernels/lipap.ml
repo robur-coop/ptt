@@ -250,6 +250,9 @@ module Outgoing = struct
       | ( Error (`Temporary_failure `Error_processing)
         , Some from
         , Colombe.Forward_path.Forward_path fp ) ->
+          Logs.debug (fun m ->
+              m "Got a temporary failure for %a (possibly greylist)"
+                Colombe.Path.pp fp);
           let[@warning "-8"] (Some (stream, _)) = Seq.uncons seq in
           let str = Flux.Stream.into Flux.Sink.string stream in
           Temp.add_new_failure cfg.temp ~counter ~from fp str;

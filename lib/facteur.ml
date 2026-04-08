@@ -204,6 +204,11 @@ let many t ~info resolver ~destination:domain txs seq =
 
 module By_domain = Map.Make (Colombe.Domain)
 
+let pp_tx ppf (rp, fp) =
+  Fmt.pf ppf "%a -> %a" Colombe.Reverse_path.pp rp Colombe.Forward_path.pp fp
+
+let pp_txs = Fmt.(list ~sep:(any ",") pp_tx)
+
 (* TODO(dinosaure): multiple [from] and multiple [recipients]. *)
 let broadcast t ~info resolver txs seq =
   if txs = [] then invalid_arg "Facteur.broadcast: recipients must not be empty";
@@ -222,6 +227,8 @@ let broadcast t ~info resolver txs seq =
   let prms =
     let fn (destination, txs) =
       Miou.async @@ fun () ->
+      Log.debug (fun m ->
+          m "Send email to %a, %a" Colombe.Domain.pp destination pp_txs txs);
       (destination, many t ~info resolver ~destination txs seq)
     in
     List.map fn groups

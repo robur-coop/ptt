@@ -1,4 +1,4 @@
-let src = Logs.Src.create "bounces"
+let src = Logs.Src.create "ptt.bounces"
 
 module Log = (val Logs.src_log src : Logs.LOG)
 
