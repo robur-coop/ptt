@@ -39,7 +39,24 @@ nec.hvt: nec.hvt.target
 	@echo " STRIP nec.hvt"
 	@strip $@
 
-all: lipap.hvt nec.hvt | vendors
+ptt.target: | vendors
+	@rm -f ./bin/ptt.exe
+	@echo " DESCR ptt.exe"
+	@dune describe location \
+		--context default --no-print-directory --root . --display=quiet \
+		./bin/pptt.exe 1> $@ 2>&1
+	@echo " BUILD ptt.exe"
+	@dune build --root . --profile=release ./bin/ptt.exe
+
+ptt: ptt.target
+	@echo " COPY ptt.exe: $(cat ptt.target)"
+	@cp $(file < ptt.target) $@
+
+ptt.install: lipap.hvt nec.hvt ptt
+	@echo " GEN ptt.install"
+	@ocaml install.ml > $@
+
+all: ptt.install | vendors
 
 .PHONY: clean
 clean:
@@ -48,3 +65,10 @@ clean:
 	rm -f lipap.hvt
 	rm -f nec.hvt.target
 	rm -f nec.hvt
+	rm -f ptt.target
+	rm -f ptt
+	rm -f ptt.install
+
+install: ptt.install
+	@echo " INSTALL ptt"
+	opam-installer ptt.install

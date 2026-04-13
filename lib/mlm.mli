@@ -19,6 +19,8 @@ val json :
 val name : t -> string
 val domain : t -> Colombe.Domain.t
 val subscribers : t -> Colombe.Path.t list
+val add_moderator : t -> Colombe.Path.t -> t
+val add_subscriber : t -> Colombe.Path.t -> t
 val with_subscribers : t -> Colombe.Path.t list -> t
 val save : t -> unit
 

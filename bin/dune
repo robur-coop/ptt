@@ -1,0 +1,14 @@
+(executable
+ (name ptt)
+ (enabled_if
+  (= %{context_name} "default"))
+ (libraries logs.cli logs.fmt fmt.cli fmt.tty cmdliner unix ptt.temp ptt.bounces mfat.bos ptt.mlm)
+ (foreign_stubs
+  (language c)
+  (flags
+   :standard
+   "-Wall"
+   "-Wshadow"
+   "-Wpointer-arith"
+   "-Wcast-qual"
+   "-Wsign-compare")))

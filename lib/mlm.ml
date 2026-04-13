@@ -33,39 +33,6 @@ module Pending_subscriptions = struct
   include Lru.M.Make (Key) (Value)
 end
 
-(* bounces/undeliverable mails
-  - connection to remote MX failed / MX complained about mailbox full or user does not exist
-    --> add the failing subscriber to our list of failures
-  - successfully delivered the mail, and the remote MX forwards it to some other mail server
-    -> that can now as well fail, but our connection is already closed
-    -> the MX that failed to forward it, will send back an automated reply to ptt-bounce-12-reyn.or=data.coop@mailingl.st
-
-  what to do with failures?
-    usually, we accept up to 3 failures in a row.
-    if mail 1 couldn't be delivered by any means to hannes@mehnert.org, that's fine. but we remember that.
-    if mail 2 ..
-    if mail 3 as well failed to deliver, we unsubscribe hannes@mehnert.org
-
-    if mail 2 actually succeeds (or mail 3), we remove all hannes@mehnert.org from the list of bounces
-
-
-  simply unsubscribe if there's a failure <- that's the alternative, much easier
-
-  we send an email to reynir@data.coop with ptt-14-reynir=data@coop@mailingl.st
-  -> we fail
-  -> we add reynir@data.coop, failed: 14 into our bounces list
-  -> we receive an email with RCPT-TO:<ptt-return-14-reynir=data.coop@mailingl.st
-  -> we add reynir@data.coop with attempts +  1 to our bounces
-
-  -> our bounce list grows with our failures when we would like to send emails
-     + also grows when we receive email such as ptt-return-*-forward-path@mailingl.st
-
-     --> whenever the bounce list grows, we check whether it is now above 5
-        -> then we unsubscribe, and empty the bounce list for that subscriber
-
-      --> whenever we successfully deliver a mail, we empty the bounce list
-
- *)
 type t = {
     name: Emile.local
   ; domain: Colombe.Domain.t
@@ -129,6 +96,18 @@ let is_moderator ~from t =
 let is_subscriber t path =
   let fn = Colombe.Path.equal path in
   List.exists fn t.subscribers
+
+let add_moderator t path =
+  let fn = Colombe.Path.equal path in
+  let fn = Fun.negate fn in
+  if List.exists fn t.moderators then t
+  else { t with moderators= path :: t.moderators }
+
+let add_subscriber t path =
+  let fn = Colombe.Path.equal path in
+  let fn = Fun.negate fn in
+  if List.exists fn t.subscribers then t
+  else { t with subscribers= path :: t.subscribers }
 
 let messageID ?g t =
   let now = Mirage_ptime.now () in
