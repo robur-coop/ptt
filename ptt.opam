@@ -21,6 +21,7 @@ depends: [
   "dmarc"
   "uspf"
   "dkim"
+  "re"
 ]
 build: [
   [make "all"]
