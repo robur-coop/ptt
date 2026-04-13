@@ -39,7 +39,7 @@ pin-depends: [
   [ "msendmail.dev"           "git+https://github.com/mirage/colombe.git#478d109e41ea250982dbecd7ff0b8c7873ad8c51" ]
   [ "uspf.dev"                "git+https://github.com/mirage/uspf.git#2dd0900b9629be2f16846ffbe58674f76227da18" ]
   [ "dkim.dev"                "git+https://github.com/mirage/ocaml-dkim.git#782d29d292095ba6e6f0ff8a0858e06921371bb9" ]
-  [ "arc.dev"                 "git+https://github.com/mirage/ocaml-arc.git#c568290e4318a022d0a0a0b87a626c5e1168463e" ]
+  [ "arc.dev"                 "git+https://github.com/robur-coop/ocaml-arc.git#c568290e4318a022d0a0a0b87a626c5e1168463e" ]
   [ "zarith.dev"              "git+https://github.com/mirage/Zarith.git#df8969d9bb95cffca13e31a615189ab27ada0684" ]
   [ "prettym.dev"             "git+https://github.com/dinosaure/prettym.git#e984a0afcf87b6cdc095830e1e73bc7d9a62f79b" ]
   [ "mfat.dev"                "git+https://git.robur.coop/robur/mfat.git#14458cc1711a32af5bca620bbf8750d84f5b1ebc" ]
