@@ -96,7 +96,7 @@
   bytesrw
   mirage-crypto-rng-mkernel
   gmp
-  mfat
+  mfat.bos
   re
   mkernel
   mnet

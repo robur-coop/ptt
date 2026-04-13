@@ -6,16 +6,21 @@ module Blk = struct
   let write = Mkernel.Block.atomic_write
 end
 
-module Fat = Mfat.Make (Blk)
+module Bos = Mfat_bos.Make (Blk)
 module RNG = Mirage_crypto_rng.Fortuna
 module S = Map.Make (String)
 open Utils
 
 let ( let@ ) finally fn = Fun.protect ~finally fn
 let ( let* ) = Result.bind
-let ( / ) = Filename.concat
 let msgf fmt = Fmt.kstr (fun msg -> `Msg msg) fmt
 let msg str = `Msg str
+let msg_to_failure = function Ok v -> v | Error (`Msg msg) -> failwith msg
+
+let msg_to_log ~msg:head = function
+  | Ok v -> v
+  | Error (`Msg msg) -> Logs.err (fun m -> m "%s: %s" head msg)
+
 let rng () = Mirage_crypto_rng_mkernel.initialize (module RNG)
 let rng = Mkernel.map rng Mkernel.[]
 
@@ -493,127 +498,82 @@ let server ~cfg ~info tcp dns_key ~hostname ~key_seed (dns_ip, dns_port) =
 
 let fat ~name =
   let fn blk () =
-    let v = Fat.create blk in
+    let v = Bos.create blk in
     let v = Result.map_error (fun (`Msg msg) -> msg) v in
     Result.error_to_failure v
   in
   Mkernel.map fn [ Mkernel.block name ]
 
+let update fs filepath json t =
+  let str = Jsont_bytesrw.encode_string (Lazy.force json) t in
+  let* str = Result.map_error msg str in
+  let* () = Bos.File.delete fs ~must_exist:false filepath in
+  Bos.File.write fs filepath str
+
 let lists ~cfg ~info fs =
-  let* entries = Fat.ls fs "lists" in
+  let* entries = Bos.Dir.contents fs (Fpath.v "lists") in
   Logs.debug (fun m -> m "%d possible mailing lists" (List.length entries));
-  let fn acc = function
-    | { Mfat.is_dir= true; _ } -> acc
-    | { Mfat.name= filepath; _ } ->
-        let name = Filename.chop_extension filepath in
-        let result =
-          let* name = Mlm.local_of_string name in
-          let name = Colombe_emile.of_local name in
-          let* contents = Fat.read fs ("lists" / filepath) in
-          let rec jsont = lazy (Mlm.json ~store ~domain:info.Ptt.domain name)
-          and store t =
-            let str = Jsont_bytesrw.encode_string (Lazy.force jsont) t in
-            let str = Result.get_ok str in
-            let process () =
-              (* TODO(dinosaure): should be an atomic operation (power failure). *)
-              let* () = Fat.remove fs ("lists" / filepath) in
-              let* () = Fat.write fs ("lists" / filepath) str in
-              cfg.lists <- S.add (Mlm.name t) t cfg.lists;
-              Ok ()
-            in
-            match process () with
-            | Ok () -> ()
-            | Error (`Msg msg) ->
-                Logs.err (fun m ->
-                    m "Error during saving a new state for %a: %s"
-                      Emile.pp_mailbox (Mlm.to_emile t) msg)
-          in
-          let jsont = Lazy.force jsont in
-          Jsont_bytesrw.decode_string jsont contents |> Result.map_error msg
+  let fn acc path =
+    if Fpath.is_dir_path path then acc
+    else
+      let name = Fpath.basename (Fpath.rem_ext path) in
+      let result =
+        let* name = Mlm.local_of_string name in
+        let name = Colombe_emile.of_local name in
+        let* contents = Bos.File.read fs path in
+        let rec json = lazy (Mlm.json ~store ~domain:info.Ptt.domain name)
+        and store t =
+          update fs path json t |> msg_to_log ~msg:"lists";
+          cfg.lists <- S.add (Mlm.name t) t cfg.lists
         in
-        begin match result with
-        | Ok t ->
-            Logs.debug (fun m -> m "Add %s as a mailing list" name);
-            S.add name t acc
-        | Error (`Msg msg) ->
-            Logs.warn (fun m -> m "Invalid mailing list %s: %s" name msg);
-            acc
-        end
+        let json = Lazy.force json in
+        Jsont_bytesrw.decode_string json contents |> Result.map_error msg
+      in
+      begin match result with
+      | Ok t ->
+          Logs.debug (fun m -> m "Add %s as a mailing list" name);
+          S.add name t acc
+      | Error (`Msg msg) ->
+          Logs.warn (fun m -> m "Invalid mailing list %s: %s" name msg);
+          acc
+      end
   in
   let m = List.fold_left fn S.empty entries in
   Ok m
 
+let bounces_json = Fpath.v "bounces.json"
+
 let bounces fs =
-  let rec jsont = lazy (Bounces.json ~store ())
-  and store t =
-    let str = Jsont_bytesrw.encode_string (Lazy.force jsont) t in
-    let str = Result.get_ok str in
-    let process () =
-      (* TODO(dinosaure): should be an atomic operation (power failure). *)
-      let _ = Fat.remove fs "bounces.json" in
-      Fat.write fs "bounces.json" str
-    in
-    match process () with
-    | Ok () -> ()
-    | Error (`Msg msg) ->
-        Logs.err (fun m -> m "Error during saving bounces state: %s" msg)
-  in
-  let process () =
-    let* contents = Fat.read fs "bounces.json" in
-    let jsont = Lazy.force jsont in
-    Jsont_bytesrw.decode_string jsont contents |> Result.map_error msg
-  in
-  match process () with Ok bounces -> bounces | _ -> Bounces.create ~store ()
+  let rec json = lazy (Bounces.json ~store ())
+  and store t = update fs bounces_json json t |> msg_to_log ~msg:"bounces" in
+  let* exists = Bos.exists fs bounces_json in
+  if exists then
+    let* contents = Bos.File.read fs bounces_json in
+    let json = Lazy.force json in
+    Jsont_bytesrw.decode_string json contents |> Result.map_error msg
+  else Ok (Bounces.create ~store ())
+
+let temp_json = Fpath.v "temp.json"
 
 let temp ~info client resolver fs bounces =
-  let msgID_to_string (local, (domain : Mrmime.MessageID.domain)) =
+  let to_path (local, (domain : Mrmime.MessageID.domain)) =
     let domain = (domain :> Emile.domain) in
     let mailbox = { Emile.name= None; local; domain= (domain, []) } in
-    Emile.to_string mailbox
+    Fpath.(v "tmp" / Emile.to_string mailbox)
   in
-  let add fs msgID str =
-    let path = "tmp" / msgID_to_string msgID in
-    match Fat.write fs path str with
-    | Ok () -> ()
-    | Error (`Msg msg) ->
-        Logs.warn (fun m -> m "Impossible to write %s: %s" path msg)
-  in
-  let rem fs msgID =
-    let path = "tmp" / msgID_to_string msgID in
-    ignore (Fat.remove fs path)
-  in
-  let get fs msgID =
-    let path = "tmp" / msgID_to_string msgID in
-    match Fat.read fs path with
-    | Ok str -> str
-    | Error (`Msg msg) -> Fmt.failwith "%s does not exist: %s" path msg
-  in
+  let add fs msgID v = Bos.File.write fs (to_path msgID) v |> msg_to_failure in
+  let rem fs msgID = Bos.File.delete fs (to_path msgID) |> msg_to_failure in
+  let get fs msgID = Bos.File.read fs (to_path msgID) |> msg_to_failure in
   let action = { Temp.get; rem; add } in
-  let rec jsont =
-    lazy (Temp.json ~info ~store client resolver fs action bounces)
-  and store t =
-    let str = Jsont_bytesrw.encode_string (Lazy.force jsont) t in
-    let str = Result.get_ok str in
-    let process () =
-      (* TODO(dinosaure): should be an atomic operation (power failure). *)
-      let _ = Fat.remove fs "temp.json" in
-      Fat.write fs "temp.json" str
-    in
-    match process () with
-    | Ok () -> ()
-    | Error (`Msg msg) ->
-        Logs.err (fun m -> m "Error during saving temp state: %s" msg)
-  in
-  let process () =
-    (* NOTE(dinosaure): ensure that we have [tmp/]. *)
-    ignore (Fat.mkdir fs "tmp");
-    let* contents = Fat.read fs "temp.json" in
-    let jsont = Lazy.force jsont in
-    Jsont_bytesrw.decode_string jsont contents |> Result.map_error msg
-  in
-  match process () with
-  | Ok tmp -> tmp
-  | Error _ -> Temp.create ~info ~store client resolver fs action bounces
+  let rec json = lazy (Temp.json ~info ~store client resolver fs action bounces)
+  and store t = update fs temp_json json t |> msg_to_log ~msg:"temp" in
+  let* _ = Bos.Dir.create fs ~path:true (Fpath.v "tmp") in
+  let* exists = Bos.exists fs temp_json in
+  if exists then
+    let* contents = Bos.File.read fs temp_json in
+    let json = Lazy.force json in
+    Jsont_bytesrw.decode_string json contents |> Result.map_error msg
+  else Ok (Temp.create ~info ~store client resolver fs action bounces)
 
 let run _ (cidrv4, gateway, ipv6) info nameservers forward_granted_for to_arc
     to_dkim cert admin =
@@ -653,10 +613,11 @@ let run _ (cidrv4, gateway, ipv6) info nameservers forward_granted_for to_arc
     let fn = Ipaddr.Prefix.mem ipaddr in
     List.exists fn forward_granted_for
   in
-  let bounces = bounces fs in
+  let bounces = bounces fs |> msg_to_failure in
   let temp, tempd =
     let resolver = resolver_from_dns dns in
     let temp = temp ~info:(snd info) client resolver fs bounces in
+    let temp = msg_to_failure temp in
     let tempd = Miou.async @@ fun () -> Temp.launch temp in
     (temp, tempd)
   in

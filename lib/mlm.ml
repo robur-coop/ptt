@@ -597,6 +597,21 @@ let incoming t bounces ~from ~rcpt:({ Colombe.Path.local; _ } as rcpt) bstr =
       if is_subscriber t forward_path then
         Bounces.signaled_for bounces ~counter forward_path;
       Ok (t, [], [])
+  | "remove" :: rem ->
+      let verp = String.concat "-" rem in
+      let* subscriber = decode_verp verp in
+      if is_moderator ~from t then begin
+        let fn = Colombe.Path.equal subscriber in
+        let fn = Fun.negate fn in
+        let subscribers = List.filter fn t.subscribers in
+        let t = { t with subscribers } in
+        t.store t;
+        Ok (t, [], [])
+      end
+      else
+        error_msgf "%a is not authorized as a moderator to remove %a into %a"
+          Colombe.Reverse_path.pp from Colombe.Path.pp subscriber
+          Emile.pp_mailbox (to_emile t)
   | _ ->
       Log.warn (fun m ->
           m "Ignoring email from %a" Colombe.Reverse_path.pp from);

@@ -4,15 +4,6 @@ module Log = (val Logs.src_log src : Logs.LOG)
 module Aggregate = Aggregate
 
 type info = { domain: Colombe.Domain.t; tls: Tls.Config.client option }
-
-(*
-type email =
-  { from : Reverse_path.t
-  ; recipients : Forward_path.t list
-  ; destination : string
-  ; stream : string Flux.Stream.t }
-*)
-
 type buffers = bytes * bytes * (char, Bigarray.int8_unsigned_elt) Ke.Rke.t
 type t = { he: Mnet_happy_eyeballs.t; pool: buffers Cattery.t }
 

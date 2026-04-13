@@ -1,28 +1,4 @@
-(*
 (** Mailing List Manager *)
-
-type who = Moderators | Subscribers | Public
-type subscription_status = Awaiting_moderation | Awaiting_confirmation
-
-type t = {
-    name: string
-  ; domain: Colombe.Domain.t
-  ; moderators: Colombe.Path.t list
-  ; subscribers: Colombe.Path.t list
-  ; pending_subscriptions:
-      (subscription_status * string (* id *) * Colombe.Path.t) list
-  ; subscription_moderated: bool
-  ; moderated: bool
-  ; who_can_post: who
-  ; who_is_moderated: who
-  ; pending_mails:
-      (string (* id *) * Colombe.Path.t (* original_from *) * Bstr.t (* mail *))
-      list
-  ; bounces: (int (* counter *) * int (* score *) * Colombe.Path.t) list
-  ; counter: int
-  ; footer: string option
-}
-*)
 
 val local_to_string : Emile.local -> string
 
