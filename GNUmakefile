@@ -44,7 +44,7 @@ ptt.target: | vendors
 	@echo " DESCR ptt.exe"
 	@dune describe location \
 		--context default --no-print-directory --root . --display=quiet \
-		./bin/pptt.exe 1> $@ 2>&1
+		./bin/ptt.exe 1> $@ 2>&1
 	@echo " BUILD ptt.exe"
 	@dune build --root . --profile=release ./bin/ptt.exe
 
