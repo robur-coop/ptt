@@ -23,3 +23,6 @@
 [ ! -d "vendors/dkim" ] && opam source dkim --dir vendors/dkim
 [ ! -d "vendors/uspf" ] && opam source uspf --dir vendors/uspf
 [ ! -d "vendors/arc" ] && opam source arc --dir vendors/arc
+[ ! -d "vendors/dns-tsig" ] && opam source dns-tsig --dir vendors/dns-tsig
+[ ! -d "vendors/mfat" ] && opam source mfat --dir vendors/mfat
+[ ! -d "vendors/cachet" ] && opam source cachet --dir vendors/cachet
