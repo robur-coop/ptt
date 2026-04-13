@@ -43,4 +43,3 @@ pin-depends: [
   [ "mfat.dev"                "git+https://git.robur.coop/robur/mfat.git#14458cc1711a32af5bca620bbf8750d84f5b1ebc" ]
   [ "mrmime.dev"              "git+https://github.com/mirage/mrmime.git#ffce7951d3df81d5555c0686489535e21e6443da" ]
 ]
-]
