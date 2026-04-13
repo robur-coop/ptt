@@ -18,7 +18,7 @@ jobs:
           opam-local-packages: |
             *.opam
       - name: Install dependencies
-        run: opam install immuable --verbose-on=ptt
+        run: opam install ptt --verbose-on=ptt
       - name: Check {lipap,nec}.hvt
         run: |
           file $(opam var bin)/lipap.hvt
