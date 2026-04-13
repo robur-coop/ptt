@@ -1,32 +1,46 @@
 opam-version: "2.0"
 maintainer: "Robur <team@robur.coop>"
 authors: ["Robur <team@robur.coop>"]
-homepage: "https://github.com/robur-coop/immuable"
-dev-repo: "git+https://github.com/robur-coop/immuable.git"
-bug-reports: "https://github.com/robur-coop/immuable/issues"
+homepage: "https://github.com/robur-coop/ptt"
+dev-repo: "git+https://github.com/robur-coop/ptt.git"
+bug-reports: "https://github.com/robur-coop/ptt/issues"
 license: "MIT"
 
 depends: [
   "ocaml" {>= "5.3.0"}
   "dune" {>= "3.0.0"}
-  "vif"
   "mirage-crypto-rng-mkernel"
-  "vifu"
   "progress"
   "flux"
   "carton"
   "art"
   "encore"
   "cattery"
+  "msendmail"
+  "arc"
+  "dmarc"
+  "uspf"
+  "dkim"
 ]
 build: [
   [make "all"]
 ]
-synopsis: "An unikernel which serve HTTP contents"
+synopsis: "Unikernels for SMTP services"
 pin-depends: [
-  [ "mnet.dev"                        "git+https://git.robur.coop/robur/mnet.git#26214790b53df78c00eafc48594cfa01290de0df" ]
-  [ "mhttp.dev"                       "git+https://github.com/dinosaure/mhttp.git#0638dd4620757c0a8062afaa75d1546ae206a604" ]
-  [ "flux.dev"                        "git+https://github.com/robur-coop/flux.git#7c4d8733596fd54f2f865c32747ba0eebdb964da" ]
-  [ "fluxt.dev"                       "git+https://github.com/robur-coop/flux.git#7c4d8733596fd54f2f865c32747ba0eebdb964da" ]
-  [ "cattery.dev"                     "git+https://git.robur.coop/robur/cattery.git#7cf6fd84c660484776252e6595b5a252ada23c30" ]
+  [ "mnet.dev"                "git+https://git.robur.coop/robur/mnet.git#5f98dc8e8166cc047ef0d59fccd26ec7fb02eff6" ]
+  [ "mnet-cli.dev"            "git+https://git.robur.coop/robur/mnet.git#5f98dc8e8166cc047ef0d59fccd26ec7fb02eff6" ]
+  [ "mnet-happy-eyeballs.dev" "git+https://git.robur.coop/robur/mnet.git#5f98dc8e8166cc047ef0d59fccd26ec7fb02eff6" ]
+  [ "mnet-tls.dev"            "git+https://git.robur.coop/robur/mnet.git#5f98dc8e8166cc047ef0d59fccd26ec7fb02eff6" ]
+  [ "cattery.dev"             "git+https://git.robur.coop/robur/cattery.git#d0ce64092a381ef8491172fe4587dc1fc4736e33" ]
+  [ "colombe.dev"             "git+https://github.com/mirage/colombe.git#478d109e41ea250982dbecd7ff0b8c7873ad8c51" ]
+  [ "sendmail.dev"            "git+https://github.com/mirage/colombe.git#478d109e41ea250982dbecd7ff0b8c7873ad8c51" ]
+  [ "msendmail.dev"           "git+https://github.com/mirage/colombe.git#478d109e41ea250982dbecd7ff0b8c7873ad8c51" ]
+  [ "uspf.dev"                "git+https://github.com/mirage/uspf.git#2dd0900b9629be2f16846ffbe58674f76227da18" ]
+  [ "dkim.dev"                "git+https://github.com/mirage/ocaml-dkim.git#782d29d292095ba6e6f0ff8a0858e06921371bb9" ]
+  [ "arc.dev"                 "git+https://github.com/mirage/ocaml-arc.git#c568290e4318a022d0a0a0b87a626c5e1168463e" ]
+  [ "zarith.dev"              "git+https://github.com/mirage/Zarith.git#df8969d9bb95cffca13e31a615189ab27ada0684" ]
+  [ "prettym.dev"             "git+https://github.com/dinosaure/prettym.git#e984a0afcf87b6cdc095830e1e73bc7d9a62f79b" ]
+  [ "mfat.dev"                "git+https://git.robur.coop/robur/mfat.git#14458cc1711a32af5bca620bbf8750d84f5b1ebc" ]
+  [ "mrmime.dev"              "git+https://github.com/mirage/mrmime.git#ffce7951d3df81d5555c0686489535e21e6443da" ]
+]
 ]
