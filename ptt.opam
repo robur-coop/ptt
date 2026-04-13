@@ -44,4 +44,5 @@ pin-depends: [
   [ "prettym.dev"             "git+https://github.com/dinosaure/prettym.git#e984a0afcf87b6cdc095830e1e73bc7d9a62f79b" ]
   [ "mfat.dev"                "git+https://git.robur.coop/robur/mfat.git#14458cc1711a32af5bca620bbf8750d84f5b1ebc" ]
   [ "mrmime.dev"              "git+https://github.com/mirage/mrmime.git#ffce7951d3df81d5555c0686489535e21e6443da" ]
+  [ "duration.dev"            "git+https://github.com/dinosaure/duration.git#4a999b4b80fd163a15af678d27206009cf957deb" ]
 ]
