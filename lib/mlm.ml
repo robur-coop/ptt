@@ -109,6 +109,8 @@ let add_subscriber t path =
   if List.exists fn t.subscribers then t
   else { t with subscribers= path :: t.subscribers }
 
+let moderators { moderators; _ } = moderators
+
 let messageID ?g t =
   let now = Mirage_ptime.now () in
   let now = Ptime.to_float_s now in
@@ -601,4 +603,5 @@ let name t = local_to_string t.name
 let domain t = t.domain
 let subscribers t = t.subscribers
 let with_subscribers t subscribers = { t with subscribers }
+let with_moderators t moderators = { t with moderators }
 let save t = t.store t

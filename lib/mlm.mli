@@ -22,6 +22,8 @@ val subscribers : t -> Colombe.Path.t list
 val add_moderator : t -> Colombe.Path.t -> t
 val add_subscriber : t -> Colombe.Path.t -> t
 val with_subscribers : t -> Colombe.Path.t list -> t
+val with_moderators : t -> Colombe.Path.t list -> t
+val moderators : t -> Colombe.Path.t list
 val save : t -> unit
 
 type outgoing = {

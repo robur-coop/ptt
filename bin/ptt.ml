@@ -1,6 +1,7 @@
 let ( let* ) = Result.bind
 let failwithf fmt = Fmt.kstr failwith fmt
 let msg msg = `Msg msg
+let msgf fmt = Fmt.kstr (fun msg -> `Msg msg) fmt
 let error_msgf fmt = Fmt.kstr (fun msg -> Error (`Msg msg)) fmt
 
 module Blk = struct
@@ -39,6 +40,10 @@ let serialize t filepath json value =
   let* str = Result.map_error msg str in
   Bos.File.write t filepath str
 
+let deserialize t filepath json =
+  let* str = Bos.File.read t filepath in
+  Jsont_bytesrw.decode_string json str |> Result.map_error msg
+
 let create _quiet filepath total_sectors =
   let fd =
     Unix.openfile (Fpath.to_string filepath) Unix.[ O_CREAT; O_RDWR ] 0o644
@@ -72,9 +77,36 @@ let add _quiet domain filepath moderators subscribers name =
     let* () = serialize t dst json list in
     Ok ()
 
-let deserialize t filepath json =
-  let* str = Bos.File.read t filepath in
-  Jsont_bytesrw.decode_string json str |> Result.map_error msg
+let set_moderators _quiet domain filepath action moderator name =
+  let fd = Unix.openfile (Fpath.to_string filepath) Unix.[ O_RDWR ] 0o644 in
+  let finally () = Unix.close fd in
+  Fun.protect ~finally @@ fun () ->
+  let* t = Bos.create fd in
+  let src = Fpath.add_ext "json" Fpath.(v "lists" / Mlm.local_to_string name) in
+  let* exists = Bos.File.exists t src in
+  if exists then
+    let json = Mlm.json ~domain name in
+    let* list = deserialize t src json in
+    match action with
+    | `Add ->
+        let moderators = Mlm.moderators list in
+        let fn = Colombe.Path.equal moderator in
+        let fn = Fun.negate fn in
+        let moderators = List.filter fn moderators in
+        let moderators = moderator :: moderators in
+        let list = Mlm.with_moderators list moderators in
+        serialize t src json list
+    | `Rem ->
+        let moderators = Mlm.moderators list in
+        let fn = Colombe.Path.equal moderator in
+        let fn = Fun.negate fn in
+        let moderators = List.filter fn moderators in
+        let list = Mlm.with_moderators list moderators in
+        serialize t src json list
+  else
+    let domain = Colombe_emile.of_domain domain in
+    let m = { Emile.name= None; local= name; domain= (domain, []) } in
+    error_msgf "The mailing list %a does not exist" Emile.pp_mailbox m
 
 let show _quiet domain filepath =
   let fd = Unix.openfile (Fpath.to_string filepath) Unix.[ O_RDWR ] 0o644 in
@@ -209,20 +241,23 @@ let filepath =
   & pos 0 (some (conv (parser, Fpath.pp))) None
   & info [] ~doc ~docv:"IMAGE"
 
-let spath =
-  let parser = Colombe.Path.of_string in
+let email =
+  let parser str =
+    Result.map Colombe_emile.to_path (Emile.of_string str)
+    |> Result.map_error (msgf "%a" Emile.pp_error)
+  in
   let pp = Colombe.Path.pp in
   Arg.conv (parser, pp) ~docv:"EMAIL"
 
 let moderators =
   let doc = "Moderators of the given mailing list." in
   let open Arg in
-  non_empty & opt_all spath [] & info [ "m"; "moderator" ] ~doc ~docv:"EMAIL"
+  non_empty & opt_all email [] & info [ "m"; "moderator" ] ~doc ~docv:"EMAIL"
 
 let subscribers =
   let doc = "Subscribers of the given mailing list." in
   let open Arg in
-  value & opt_all spath [] & info [ "s"; "subscriber" ] ~doc ~docv:"EMAIL"
+  value & opt_all email [] & info [ "s"; "subscriber" ] ~doc ~docv:"EMAIL"
 
 let local =
   let parser str =
@@ -265,6 +300,36 @@ let cmd_show =
   let info = Cmd.info "show" ~doc ~man in
   Cmd.v info term_show
 
+let term_set_moderator action =
+  let open Term in
+  let email =
+    let doc = "The email of the moderator." in
+    let open Arg in
+    required & pos 2 (some email) None & info [] ~doc ~docv:"EMAIL"
+  in
+  const set_moderators
+  $ setup_logs
+  $ domain
+  $ filepath
+  $ const action
+  $ email
+  $ name
+  |> term_result ~usage:false
+
+let cmd_set_moderator action =
+  let doc =
+    match action with
+    | `Add -> "Add moderator into the given mailing list."
+    | `Rem -> "Remove moderator from the given mailing list."
+  in
+  let man = [] in
+  let info =
+    match action with
+    | `Add -> Cmd.info ~doc ~man "add-moderator"
+    | `Rem -> Cmd.info ~doc ~man "rem-moderator"
+  in
+  Cmd.v info (term_set_moderator action)
+
 let default =
   let open Term in
   ret (const (`Help (`Pager, None)))
@@ -273,5 +338,11 @@ let () =
   let doc = "A tool to prepare image required by $(b,ptt) unikernels." in
   let man = [] in
   let info = Cmd.info "ptt" ~doc ~man in
-  let cmd = Cmd.group info ~default [ cmd_create; cmd_add; cmd_show ] in
+  let cmd =
+    Cmd.group info ~default
+      [
+        cmd_create; cmd_add; cmd_show; cmd_set_moderator `Add
+      ; cmd_set_moderator `Rem
+      ]
+  in
   Cmd.(exit (eval cmd))
