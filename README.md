@@ -52,3 +52,10 @@ advisable to:
 - add a DMARC record `_dmarc.<your-domain>: v=DMARC1; p=quarantine;`
 - check the reverse DNS
 - make your WHOIS information public
+
+## Credits
+
+This project received funding through [NGI Zero Core](https://nlnet.nl/core), a
+fund established by [NLnet](https://nlnet.nl) with financial support from the
+European Commission's [Next Generation Internet](https://ngi.eu) program. Learn
+more at the [NLnet project page](https://nlnet.nl/project/PTT).
