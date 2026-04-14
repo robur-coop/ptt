@@ -86,6 +86,16 @@ type 'fs t = {
   ; resolver: Ptt.resolver
 }
 
+type entry = Value.t = {
+    from: Colombe.Path.t
+  ; recipient: Colombe.Path.t
+  ; messageID: Mrmime.MessageID.t
+  ; size: int
+  ; send_at: Ptime.t
+  ; attempt: int
+  ; counter: int
+}
+
 type 'fs action = {
     get: 'fs -> Mrmime.MessageID.t -> string
   ; add: 'fs -> Mrmime.MessageID.t -> string -> unit
@@ -99,6 +109,8 @@ let create ~info ?(store = ignore) client resolver fs action bounces =
   let entries = Cache.create _20MB in
   let { get; add; rem } = action in
   { get; add; rem; entries; store; bounces; fs; info; client; resolver }
+
+let list = Jsont.list Value.json
 
 let json ~info ?(store = ignore) client resolver fs action bounces =
   let entries =

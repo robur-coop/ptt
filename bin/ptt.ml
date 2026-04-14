@@ -31,13 +31,18 @@ end
 
 module Bos = Mfat_bos.Make (Blk)
 
+let temp_json = Fpath.v "temp.json"
+let bounces_json = Fpath.v "bounces.json"
+
 let serialize t filepath json value =
   let str = Jsont_bytesrw.encode_string json value in
   let* str = Result.map_error msg str in
   Bos.File.write t filepath str
 
 let create _quiet filepath total_sectors =
-  let fd = Unix.openfile (Fpath.to_string filepath) Unix.[ O_RDWR ] 0 in
+  let fd =
+    Unix.openfile (Fpath.to_string filepath) Unix.[ O_CREAT; O_RDWR ] 0o644
+  in
   let finally () = Unix.close fd in
   Fun.protect ~finally @@ fun () ->
   Bos.format fd ~total_sectors;
@@ -45,12 +50,12 @@ let create _quiet filepath total_sectors =
   let bounces = Bounces.create () in
   let* _ = Bos.Dir.create t ~path:true (Fpath.v "lists") in
   let* _ = Bos.Dir.create t ~path:true (Fpath.v "tmp") in
-  let* () = serialize t (Fpath.v "bounces.json") (Bounces.json ()) bounces in
-  let* () = serialize t (Fpath.v "temp.json") Jsont.(list (null ())) [] in
+  let* () = serialize t bounces_json (Bounces.json ()) bounces in
+  let* () = serialize t temp_json Jsont.(list (null ())) [] in
   Ok ()
 
 let add _quiet domain filepath moderators subscribers name =
-  let fd = Unix.openfile (Fpath.to_string filepath) Unix.[ O_RDWR ] 0 in
+  let fd = Unix.openfile (Fpath.to_string filepath) Unix.[ O_RDWR ] 0o644 in
   let finally () = Unix.close fd in
   Fun.protect ~finally @@ fun () ->
   let* t = Bos.create fd in
@@ -67,10 +72,46 @@ let add _quiet domain filepath moderators subscribers name =
     let* () = serialize t dst json list in
     Ok ()
 
-let _show _quiet filepath =
-  let fd = Unix.openfile (Fpath.to_string filepath) Unix.[ O_RDWR ] 0 in
+let deserialize t filepath json =
+  let* str = Bos.File.read t filepath in
+  Jsont_bytesrw.decode_string json str |> Result.map_error msg
+
+let show _quiet domain filepath =
+  let fd = Unix.openfile (Fpath.to_string filepath) Unix.[ O_RDWR ] 0o644 in
   let finally () = Unix.close fd in
-  Fun.protect ~finally @@ fun () -> assert false
+  Fun.protect ~finally @@ fun () ->
+  let* t = Bos.create fd in
+  let* temp_exists = Bos.exists t temp_json in
+  let* temps =
+    if temp_exists then deserialize t temp_json Temp.list else Ok []
+  in
+  let* lists =
+    let fn filepath =
+      let bname = Fpath.(basename (rem_ext filepath)) in
+      let* local = Mlm.local_of_string bname in
+      let local = Colombe_emile.of_local local in
+      let json = Mlm.json ~domain local in
+      deserialize t filepath json
+    in
+    let fn filepath acc =
+      match fn filepath with
+      | Ok list -> list :: acc
+      | Error _ ->
+          Logs.warn (fun m ->
+              m "%a is not a valid JSON object to describe a list, ignore it"
+                Fpath.pp filepath);
+          acc
+    in
+    Bos.fold ~elements:`Files ~traverse:`Any t fn [] [ Fpath.v "lists/" ]
+  in
+  let* bounces_exists = Bos.exists t bounces_json in
+  let* _bounces =
+    if bounces_exists then deserialize t bounces_json (Bounces.json ())
+    else Ok (Bounces.create ())
+  in
+  Fmt.pr "Temporary emails: %d\n%!" (List.length temps);
+  Fmt.pr "Lists: %d\n%!" (List.length lists);
+  Ok ()
 
 open Cmdliner
 
@@ -212,6 +253,18 @@ let cmd_add =
   let info = Cmd.info "add" ~doc ~man in
   Cmd.v info term_add
 
+let term_show =
+  let open Term in
+  const show $ setup_logs $ domain $ filepath |> term_result ~usage:false
+
+let cmd_show =
+  let doc =
+    "Show the current state of a mailing list from the given FAT32 image."
+  in
+  let man = [] in
+  let info = Cmd.info "show" ~doc ~man in
+  Cmd.v info term_show
+
 let default =
   let open Term in
   ret (const (`Help (`Pager, None)))
@@ -220,5 +273,5 @@ let () =
   let doc = "A tool to prepare image required by $(b,ptt) unikernels." in
   let man = [] in
   let info = Cmd.info "ptt" ~doc ~man in
-  let cmd = Cmd.group info ~default [ cmd_create; cmd_add ] in
+  let cmd = Cmd.group info ~default [ cmd_create; cmd_add; cmd_show ] in
   Cmd.(exit (eval cmd))

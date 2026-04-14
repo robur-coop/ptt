@@ -1,5 +1,15 @@
 type 'fs t
 
+type entry = {
+    from: Colombe.Path.t
+  ; recipient: Colombe.Path.t
+  ; messageID: Mrmime.MessageID.t
+  ; size: int
+  ; send_at: Ptime.t
+  ; attempt: int
+  ; counter: int
+}
+
 type 'fs action = {
     get: 'fs -> Mrmime.MessageID.t -> string
   ; add: 'fs -> Mrmime.MessageID.t -> string -> unit
@@ -25,6 +35,8 @@ val json :
   -> 'fs action
   -> Bounces.t
   -> 'fs t Jsont.t
+
+val list : entry list Jsont.t
 
 val add_new_failure :
      'fs t

@@ -41,6 +41,9 @@ module SSMTP = Ssmtp
 module Mechanism = Mechanism
 
 let ( let* ) = Result.bind
+let _1m = 60_000_000_000
+
+exception Timeout
 
 let run : type flow.
        (flow, Msendmail.Miou_scheduler.t) rdwr
@@ -52,8 +55,13 @@ let run : type flow.
   let open Colombe.State in
   let rec go = function
     | Read { buffer; off; len; k } ->
-        let res = prj (rdwr.rd flow buffer off len) in
-        go (k res)
+        let prm0 = Miou.async @@ fun () -> prj (rdwr.rd flow buffer off len) in
+        let prm1 = Miou.async @@ fun () -> Mkernel.sleep _1m; raise Timeout in
+        begin match Miou.await_first [ prm0; prm1 ] with
+        | Error Timeout -> go (k `End)
+        | Error exn -> raise exn
+        | Ok result -> go (k result)
+        end
     | Write { buffer; off; len; k } ->
         let () = prj (rdwr.wr flow buffer off len) in
         go (k len)
