@@ -69,4 +69,4 @@
  (name temp)
  (modules temp)
  (public_name ptt.temp)
- (libraries ptt.facteur ptt.bounces))
+ (libraries ptt.facteur ptt.bounces duration))
