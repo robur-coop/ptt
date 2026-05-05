@@ -501,7 +501,8 @@ let rng = Mkernel.map rng Mkernel.[]
 
 let run _ (cidrv4, gateway, ipv6) info nameservers destination cfg primary
     (verify, update) =
-  Mkernel.(run [ rng; Mnet.stack ~name:"service" ?gateway ~ipv6 cidrv4 ])
+  let now = Mkernel.clock_wall in
+  Mkernel.(run ~now [ rng; Mnet.stack ~name:"service" ?gateway ~ipv6 cidrv4 ])
   @@ fun rng (stack, tcp, udp) () ->
   let@ () = fun () -> Mirage_crypto_rng_mkernel.kill rng in
   let@ () = fun () -> Mnet.kill stack in
