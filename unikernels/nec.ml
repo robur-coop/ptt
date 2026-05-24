@@ -431,17 +431,12 @@ let rec renew tcp dns primary ~expiration:span ~self t =
   | None -> Ok ()
   | Some sec ->
       let v = Ptime.of_float_s (Int64.to_float sec) in
-      let* v = Option.to_result ~none:(msgf "Invalid expiration assigned") v in
-      let v = Ptime.diff v (Mirage_ptime.now ()) in
-      let v = Ptime.Span.to_int_s v |> Option.get in
-      (* NOTE(dinosaure): only on 64bits architectures. It should be safe to
-         cast to [int] seconds. *)
-      let nsec = v * 1_000_000_000 in
-      Logs.debug (fun m ->
-          let nsec = Int64.of_int nsec in
-          let v = Ptime.Span.of_int_s Duration.(to_sec nsec) in
-          m "renew our private key in %a" Ptime.Span.pp v);
-      Mkernel.sleep (nsec - _5s);
+      let none = msgf "Invalid expiration assigned" in
+      let* not_after = Option.to_result ~none v in
+      begin match Ptime.sub_span not_after (Ptime.Span.of_int_s 5) with
+      | Some at -> Mkernel.wakeup ~at
+      | None -> ()
+      end;
       let count = succ (count t) in
       let* key', alg = private_key ~count domain_name (pk t) in
       (* NOTE(dinosaure): we use the same private key between our [ARC-Seal]
@@ -501,8 +496,7 @@ let rng = Mkernel.map rng Mkernel.[]
 
 let run _ (cidrv4, gateway, ipv6) info nameservers destination cfg primary
     (verify, update) =
-  let now = Mkernel.clock_wall in
-  Mkernel.(run ~now [ rng; Mnet.stack ~name:"service" ?gateway ~ipv6 cidrv4 ])
+  Mkernel.(run [ rng; Mnet.stack ~name:"service" ?gateway ~ipv6 cidrv4 ])
   @@ fun rng (stack, tcp, udp) () ->
   let@ () = fun () -> Mirage_crypto_rng_mkernel.kill rng in
   let@ () = fun () -> Mnet.kill stack in

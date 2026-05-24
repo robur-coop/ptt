@@ -456,13 +456,10 @@ let server ~cfg ~info tcp dns_key ~hostname ~key_seed (dns_ip, dns_port) =
         let server = Miou.async @@ fun () -> filler () in
         let signal =
           Miou.async @@ fun () ->
-          let now = Mirage_ptime.now () in
-          let remaining = Ptime.diff not_after now in
-          let secs = Ptime.Span.to_int_s remaining |> Option.value ~default:0 in
-          let nsec = secs * 1_000_000_000 in
-          let v = Int.max 0 (nsec - _5s) in
-          Logs.debug (fun m -> m "Wait %a" Duration.pp (Int64.of_int v));
-          Mkernel.sleep v;
+          begin match Ptime.sub_span not_after (Ptime.Span.of_int_s 5) with
+          | Some at -> Mkernel.wakeup ~at
+          | None -> ()
+          end;
           Miou.Mutex.protect mutex @@ fun () -> Miou.Condition.signal condition
         in
         let rec until_expiration orphans =
