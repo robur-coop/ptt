@@ -272,6 +272,76 @@ let handler pool ~info:(sinfo, cinfo) client _dns resolver flow t =
   let () = Miou.await_exn prm1 in
   Mnet.TCP.close flow
 
+(* NOTE(dinosaure): the milter variant of [handler]. The protocol underneath
+   changes (SMTP relay -> milter), but the signing pipeline is identical: we
+   consume the message streamed into [q] with our DKIM signer and, instead of
+   re-sending the email via [Facteur.sendmail], we hand the computed
+   [DKIM-Signature] field back to Postfix through [oc] as a milter
+   modification. Only DKIM is supported in this mode. *)
+let milter_handler pool ~info:(sinfo, _cinfo) flow t =
+  Cattery.use pool @@ fun v ->
+  let _, (peer, port) = Mnet.TCP.peers flow in
+  let ic = Miou.Computation.create () in
+  let oc = Miou.Computation.create () in
+  Logs.debug (fun m -> m "new milter client: %a:%d" Ipaddr.pp peer port);
+  let q = Flux.Bqueue.(create with_close) 0x7ff in
+  let prm0 =
+    Miou.async @@ fun () ->
+    let encoder = Fun.const v.encoder
+    and decoder = Fun.const v.decoder
+    and queue = Fun.const v.queue in
+    match
+      Milter.handler ~encoder ~decoder ~queue ~info:sinfo flow (ic, oc) q
+    with
+    | Ok () -> ()
+    | Error err ->
+        Logs.err (fun m ->
+            m "%a:%d milter finished with an error: %a" Ipaddr.pp peer port
+              Milter.pp_error err)
+  in
+  let prm1 =
+    Miou.async @@ fun () ->
+    match (Miou.Computation.await_exn ic, t) with
+    | _m, DKIM t ->
+        Logs.debug (fun pd -> pd "Receive a new email to sign (DKIM/milter)");
+        let signer = dkim ~key:t.key t.dkim in
+        let into =
+          let open Flux.Sink.Syntax in
+          let+ _bstr = save_into v.contents and+ dkim = signer in
+          dkim
+        in
+        let from = Flux.Source.bqueue q in
+        let stream = Flux.Stream.from from in
+        let dkim = Flux.Stream.into into stream in
+        begin match dkim with
+        | Ok dkim ->
+            let bbh = Dkim.signature_and_hash dkim in
+            let bbh = (bbh :> string * Dkim.hash_value) in
+            let dkim = Dkim.with_signature_and_hash dkim bbh in
+            let value =
+              Prettym.to_string ~new_line Dkim.Encoder.dkim_signature dkim
+            in
+            (* A milter header value carries no field name and no trailing
+               newline; internal folding (CRLF + WSP) is preserved by the MTA. *)
+            let value = String.trim value in
+            let add = `Add_header ("DKIM-Signature", value) in
+            ignore (Miou.Computation.try_return oc add)
+        | Error err ->
+            Logs.err (fun m ->
+                m "Impossible to sign incoming email: %a" Utils.pp_error err);
+            ignore (Miou.Computation.try_return oc `Tempfail)
+        end
+    | _m, ARC _ ->
+        Logs.err (fun m ->
+            m "ARC signing is not supported in milter mode (use --with-dkim)");
+        ignore (Miou.Computation.try_return oc `Tempfail)
+    | exception _ ->
+        Logs.debug (fun m -> m "milter connection aborted before end-of-body")
+  in
+  let _ = Miou.await prm0 in
+  let () = Miou.await_exn prm1 in
+  Mnet.TCP.close flow
+
 let rec clean_up orphans =
   match Miou.care orphans with
   | Some None | None -> ()
@@ -495,7 +565,7 @@ let rng () = Mirage_crypto_rng_mkernel.initialize (module RNG)
 let rng = Mkernel.map rng Mkernel.[]
 
 let run _ (cidrv4, gateway, ipv6) info nameservers destination cfg primary
-    (verify, update) =
+    (verify, update) milter =
   Mkernel.(run [ rng; Mnet.stack ~name:"service" ?gateway ~ipv6 cidrv4 ])
   @@ fun rng (stack, tcp, udp) () ->
   let@ () = fun () -> Mirage_crypto_rng_mkernel.kill rng in
@@ -523,13 +593,6 @@ let run _ (cidrv4, gateway, ipv6) info nameservers destination cfg primary
     in
     { Facteur.he; pool }
   in
-  let resolver =
-    let gethostbyname ipaddrs _ = Result.ok ipaddrs
-    and getmxbyname _ mail_exchange =
-      Ok (Dns.Rr_map.Mx_set.singleton { preference= 0; mail_exchange })
-    in
-    Ptt.Resolver { gethostbyname; getmxbyname; dns= [ destination ] }
-  in
   let* t = get_domain_key_and_key (fst info) tcp primary cfg in
   let* () =
     let dkim = match t with ARC t -> t.msgsig | DKIM t -> t.dkim in
@@ -544,17 +607,30 @@ let run _ (cidrv4, gateway, ipv6) info nameservers destination cfg primary
   in
   let prm = renew tcp dns primary cfg t in
   let@ () = fun () -> Option.iter Miou.cancel prm in
-  let rec go orphans listen =
+  let rec go orphans listen fn =
     clean_up orphans;
     Logs.debug (fun m -> m "Waiting for a new connection");
     let flow = Mnet.TCP.accept tcp listen in
-    let _ =
-      Miou.async ~orphans @@ fun () ->
-      handler pool ~info client dns resolver flow t
-    in
-    go orphans listen
+    let _ = Miou.async ~orphans @@ fun () -> fn flow in
+    go orphans listen fn
   in
-  go (Miou.orphans ()) (Mnet.TCP.listen tcp 25)
+  match milter with
+  | Some port ->
+      Logs.debug (fun m -> m "nec running as a milter on port %d" port);
+      let fn flow = milter_handler pool ~info flow t in
+      go (Miou.orphans ()) (Mnet.TCP.listen tcp port) fn
+  | None ->
+      let none = msgf "--dst is required when running as an SMTP relay" in
+      let* destination = Option.to_result ~none destination in
+      let resolver =
+        let gethostbyname ipaddrs _ = Result.ok ipaddrs
+        and getmxbyname _ mail_exchange =
+          Ok (Dns.Rr_map.Mx_set.singleton { preference= 0; mail_exchange })
+        in
+        Ptt.Resolver { gethostbyname; getmxbyname; dns= [ destination ] }
+      in
+      let fn flow = handler pool ~info client dns resolver flow t in
+      go (Miou.orphans ()) (Mnet.TCP.listen tcp 25) fn
 
 open Cmdliner
 
@@ -873,10 +949,21 @@ let setup_signer =
   $ expiration
 
 let destination =
-  let doc = "The SMTP destination for all signed emails." in
+  let doc =
+    "The SMTP destination for all signed emails (required in relay mode, \
+     unused as a milter)."
+  in
   let ipaddr = Arg.conv Ipaddr.(of_string, pp) in
   let open Arg in
-  required & opt (some ipaddr) None & info [ "dst" ] ~doc ~docv:"IPADDR"
+  value & opt (some ipaddr) None & info [ "dst" ] ~doc ~docv:"IPADDR"
+
+let milter =
+  let doc =
+    "Run as a Postfix milter listening on the given TCP port instead of an \
+     SMTP relay. Only DKIM signing is supported in this mode."
+  in
+  let open Arg in
+  value & opt (some int) None & info [ "milter" ] ~doc ~docv:"PORT"
 
 let docs_primary_dns = "PRIMARY DNS SERVER"
 
@@ -959,6 +1046,7 @@ let term =
   $ setup_signer
   $ setup_dns_server
   $ setup_post_settings
+  $ milter
 
 let cmd =
   let term = Term.map (Result.map_error (msgf "%a" Dks.pp_error)) term in
