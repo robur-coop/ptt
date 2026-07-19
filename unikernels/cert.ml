@@ -13,6 +13,11 @@ type error =
   | `Tsig of Dns_tsig.e
   | `Unexpected_reply of Dns.Packet.reply ]
 
+let pp_error ppf = function
+  | #Dns_certify.u_err as err -> Dns_certify.pp_u_err ppf err
+  | #Dns_certify.q_err as err -> Dns_certify.pp_q_err ppf err
+  | `Msg msg -> Fmt.string ppf msg
+
 let send flow answer =
   let _, (dst, port) = Mnet.TCP.peers flow in
   try

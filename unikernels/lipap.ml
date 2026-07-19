@@ -406,92 +406,49 @@ let rec clean_up orphans =
       let _ = Miou.await prm in
       clean_up orphans
 
-let _5s = 5_000_000_000
-
-let expired certs =
-  let fn than cert =
-    let _, not_after = X509.Certificate.validity cert in
-    if Ptime.is_earlier not_after ~than then not_after else than
-  in
-  let now = Mirage_ptime.now () in
-  let not_after = List.fold_left fn now certs in
-  Ptime.is_earlier not_after ~than:now
-
-let not_expired = Fun.negate expired
-
-let server ~cfg ~info tcp dns_key ~hostname ~key_seed (dns_ip, dns_port) =
-  (* This code is primarily used to request and obtain a TLS certificate from
-     our primary DNS server. It manages the certificate’s expiry. Client
-     management is never interrupted, even during a renegotiation. We allow five
-     seconds before the certificate actually expires to initiate the new
-     renegotiation. *)
+let server ~cfg ~info tcp (self_signed, primary) =
   let listen = Mnet.TCP.listen tcp 25 in
-  let mutex = Miou.Mutex.create () in
-  let condition = Miou.Condition.create () in
-  let shared = Queue.create () in
-  let rec filler () =
-    let flow = Mnet.TCP.accept tcp listen in
-    let () =
-      Miou.Mutex.protect mutex @@ fun () ->
-      Queue.push flow shared;
-      Miou.Condition.signal condition
-    in
-    filler ()
+  let tls = CA.tls tcp (fst info) self_signed primary in
+  let tls0, not_after0 =
+    Result.map_error (Fmt.str "%a" Cert.pp_error) tls |> Result.error_to_failure
   in
-  let rec go orphans =
-    match
-      Cert.retrieve_certificate tcp dns_key ~hostname ~key_seed dns_ip dns_port
-    with
-    | Error (`Msg msg) ->
-        Fmt.failwith "Impossible to retrieve TLS certificate: %s" msg
-    | Error _ -> Fmt.failwith "Impossible to retrieve TLS certificate"
-    | Ok (certs, key) ->
-        let not_after = snd (X509.Certificate.validity (List.hd certs)) in
-        Logs.info (fun m ->
-            m "Certificate retrieved, valid until %a" Ptime.pp not_after);
-        let tls = Tls.Config.server ~certificates:(`Single (certs, key)) () in
-        let tls = Result.get_ok tls in
-        let info = ({ (fst info) with Ptt.tls= Some tls }, snd info) in
-        let handler = handler ~cfg ~info in
-        let server = Miou.async @@ fun () -> filler () in
-        let signal =
-          Miou.async @@ fun () ->
-          begin match Ptime.sub_span not_after (Ptime.Span.of_int_s 5) with
-          | Some at -> Mkernel.wakeup ~at
-          | None -> ()
-          end;
-          Miou.Mutex.protect mutex @@ fun () -> Miou.Condition.signal condition
-        in
-        let rec until_expiration orphans =
-          clean_up orphans;
-          let state =
-            Miou.Mutex.protect mutex @@ fun () ->
-            while Queue.is_empty shared && not_expired certs do
-              Miou.Condition.wait condition mutex
-            done;
-            if expired certs then `Expired
-            else begin
-              let flows = List.of_seq (Queue.to_seq shared) in
-              Queue.clear shared; `Clients flows
-            end
+  let tls = ref tls0 in
+  let prm0 =
+    Miou.async @@ fun () ->
+    let rec go = function
+      | None -> ()
+      | Some not_after ->
+          let delay = Ptime.sub_span not_after (Ptime.Span.of_int_s 5) in
+          Option.iter (fun at -> Mkernel.wakeup ~at) delay;
+          let tls' = CA.tls tcp (fst info) self_signed primary in
+          let tls', not_after =
+            Result.map_error (Fmt.str "%a" Cert.pp_error) tls'
+            |> Result.error_to_failure
           in
-          match state with
-          | `Expired ->
-              Logs.info (fun m -> m "Certificate expiring, renewing...");
-              Miou.await_exn signal;
-              Miou.cancel server
-          | `Clients flows ->
-              let fn flow =
-                let _, (peer, port) = Mnet.TCP.peers flow in
-                Logs.debug (fun m ->
-                    m "Got a new connection from %a:%d" Ipaddr.pp peer port);
-                ignore (Miou.async ~orphans @@ fun () -> handler flow)
-              in
-              List.iter fn flows; until_expiration orphans
-        in
-        until_expiration orphans; go orphans
+          tls := tls';
+          go not_after
+    in
+    go not_after0
   in
-  go (Miou.orphans ())
+  let prm1 =
+    Miou.async @@ fun () ->
+    let rec go orphans =
+      clean_up orphans;
+      let flow = Mnet.TCP.accept tcp listen in
+      let _ =
+        Miou.async @@ fun () ->
+        let info = ({ (fst info) with Ptt.tls= Some !tls }, snd info) in
+        handler ~cfg ~info flow
+      in
+      go orphans
+    in
+    go (Miou.orphans ())
+  in
+  Miou.await_all [ prm0; prm1 ]
+  |> List.iter @@ function
+     | Ok () -> ()
+     | Error exn ->
+         Fmt.failwith "Unexpected exception: %s" (Printexc.to_string exn)
 
 let fat ~name =
   let fn blk () =
@@ -574,7 +531,6 @@ let temp ~info client resolver fs bounces =
 
 let run _ (cidrv4, gateway, ipv6) info nameservers forward_granted_for to_arc
     to_dkim cert admin =
-  let hostname, cert_dns, dns_key, key_seed = cert in
   let devices =
     let open Mkernel in
     [ rng; Mnet.stack ~name:"service" ?gateway ~ipv6 cidrv4; fat ~name:"lipap" ]
@@ -650,7 +606,7 @@ let run _ (cidrv4, gateway, ipv6) info nameservers forward_granted_for to_arc
         S.empty
   in
   cfg.lists <- lists;
-  server ~cfg ~info tcp dns_key ~hostname ~key_seed cert_dns
+  server ~cfg ~info tcp cert
 
 open Cmdliner
 
@@ -774,7 +730,7 @@ let cert_dns =
   let pp ppf (ip, port) = Fmt.pf ppf "%a:%d" Ipaddr.pp ip port in
   let addr = Arg.conv (parser, pp) in
   let open Arg in
-  required
+  value
   & opt (some addr) None
   & info [ "cert-dns" ] ~doc ~docs:docs_cert ~docv:"IPADDR:PORT"
 
@@ -784,7 +740,7 @@ let cert_dns_key =
   let pp = Fmt.using Dns.Dnskey.name_key_to_string Fmt.string in
   let key = Arg.conv (parser, pp) in
   let open Arg in
-  required
+  value
   & opt (some key) None
   & info [ "cert-dns-key" ] ~doc ~docs:docs_cert ~docv:"NAME:ALGORITHM:DATA"
 
@@ -798,26 +754,45 @@ let cert_seed =
   & opt (some seed) None
   & info [ "cert-seed" ] ~doc ~docs:docs_cert ~docv:"SEED"
 
-let setup_cert (sinfo, _) cert_dns dns_key seed =
-  let* hostname =
+let self_signed =
+  let doc =
+    "Generate a reproducible self-signed certificate from the given \
+     $(b,--cert-seed) instead of retrieving one from a DNS server."
+  in
+  let open Arg in
+  value & flag & info [ "self-signed" ] ~doc ~docs:docs_cert
+
+let setup_cert (sinfo, _) cert_dns dns_key seed self_signed =
+  let* () =
     match sinfo.Ptt.domain with
     | Domain vs ->
         let* raw = Domain_name.of_strings vs in
-        Domain_name.host raw
-    | IPv4 ipv4 -> Ok (Ipaddr.V4.to_domain_name ipv4)
-    | IPv6 ipv6 -> Ok (Ipaddr.V6.to_domain_name ipv6)
+        let* _ = Domain_name.host raw in
+        Ok ()
+    | IPv4 _ipv4 -> Ok ()
+    | IPv6 _ipv6 -> Ok ()
     | Extension _ ->
         error_msgf "Impossible to launch a SMTP server with such domain: %a"
           Colombe.Domain.pp sinfo.Ptt.domain
   in
-  Ok (hostname, cert_dns, dns_key, seed)
+  match (cert_dns, dns_key, self_signed) with
+  | Some (ipaddr, port), Some key, false ->
+      Ok (None, Some ((ipaddr, port), key, seed))
+  | _, _, true -> Ok (Some seed, None)
+  | _, _, false ->
+      error_msgf
+        "The unikernel must retrieve a TLS certificate (a self-signed one or \
+         from a DNS server)"
 
 let setup_cert =
   let open Term in
-  let term =
-    const setup_cert $ Ptt_cli.term_info $ cert_dns $ cert_dns_key $ cert_seed
-  in
-  term_result term
+  const setup_cert
+  $ Ptt_cli.term_info
+  $ cert_dns
+  $ cert_dns_key
+  $ cert_seed
+  $ self_signed
+  |> term_result
 
 let admin =
   let parser str =

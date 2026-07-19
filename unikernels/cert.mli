@@ -6,6 +6,8 @@ type error =
   | `Tsig of Dns_tsig.e
   | `Unexpected_reply of Dns.Packet.reply ]
 
+val pp_error : error Fmt.t
+
 val retrieve_certificate :
      Mnet.TCP.state
   -> 'a Domain_name.t * Dns.Dnskey.t

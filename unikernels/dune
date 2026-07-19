@@ -2,7 +2,7 @@
  (name CA)
  (public_name ptt.ca)
  (modules CA)
- (libraries x509 mirage-ptime.solo5))
+ (libraries ptt ptt.cert x509 mirage-ptime.solo5))
 
 (library
  (name Dks)

@@ -1,4 +1,8 @@
+let src = Logs.Src.create "ptt.ca"
 let msgf fmt = Fmt.kstr (fun msg -> `Msg msg) fmt
+let error_msgf fmt = Fmt.kstr (fun msg -> Error (`Msg msg)) fmt
+
+module Log = (val Logs.src_log src : Logs.LOG)
 
 let prefix =
   X509.Distinguished_name.[ Relative_distinguished_name.singleton (CN "ptt") ]
@@ -10,6 +14,8 @@ let cacert_dn =
 let cacert_lifetime = Ptime.Span.v (365, 0L)
 let _10s = Ptime.Span.of_int_s 10
 let ( let* ) = Result.bind
+
+type t = X509.Certificate.t * X509.Private_key.t * X509.Authenticator.t
 
 let make domain_name ~seed =
   let* domain_name = Domain_name.of_string domain_name in
@@ -49,3 +55,39 @@ let make domain_name ~seed =
     X509.Authenticator.cert_fingerprint ~time ~hash:`SHA256 ~fingerprint
   in
   Ok (cert, `RSA pk, authenticator)
+
+let self_signed info ~seed =
+  let domain = Colombe.Domain.to_string info.Ptt.domain in
+  let* cert, pk, _ = make domain ~seed in
+  Log.info (fun m ->
+      m "Using a reproducible self-signed certificate for %s" domain);
+  let* tls = Tls.Config.server ~certificates:(`Single ([ cert ], pk)) () in
+  Ok (tls, None)
+
+let tls tcp info self_signed_cert cert_dns =
+  match (self_signed_cert, cert_dns) with
+  | None, Some ((ipaddr, port), key, key_seed) ->
+      let* hostname =
+        match info.Ptt.domain with
+        | Colombe.Domain.Domain vs ->
+            let* raw = Domain_name.of_strings vs in
+            Domain_name.host raw
+        | IPv4 ipv4 -> Ok (Ipaddr.V4.to_domain_name ipv4)
+        | IPv6 ipv6 -> Ok (Ipaddr.V6.to_domain_name ipv6)
+        | Extension _ ->
+            error_msgf "Cannot request a certificate for %a" Colombe.Domain.pp
+              info.Ptt.domain
+      in
+      let* certs, key =
+        Cert.retrieve_certificate tcp key ~hostname ~key_seed ipaddr port
+      in
+      let not_after = snd (X509.Certificate.validity (List.hd certs)) in
+      Log.info (fun m ->
+          m "Certificate retrieved from %a, valid until %a" Ipaddr.pp ipaddr
+            Ptime.pp not_after);
+      let* tls = Tls.Config.server ~certificates:(`Single (certs, key)) () in
+      Ok (tls, Some not_after)
+  | Some seed, _ -> self_signed info ~seed
+  | None, None ->
+      Fmt.invalid_arg
+        "A seed or a DNS server is required to retrive a TLS certificate"
