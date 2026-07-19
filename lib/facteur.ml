@@ -37,7 +37,8 @@ let mxs (Ptt.Resolver { dns; getmxbyname; gethostbyname }) = function
         error_msgf "No SMTP server affiliated to %a" Domain_name.pp domain_name
       else Ok mxs
 
-let sendmail t info resolver (from, ({ Aggregate.domain; locals } as a)) seq =
+let sendmail ?port t info resolver (from, ({ Aggregate.domain; locals } as a))
+    seq =
   Cattery.use t.pool @@ fun (decoder, encoder, queue) ->
   let encoder = Fun.const encoder
   and decoder = Fun.const decoder
@@ -72,14 +73,14 @@ let sendmail t info resolver (from, ({ Aggregate.domain; locals } as a)) seq =
         let destination = `Ips ipaddrs in
         let fn str = (str, 0, String.length str) in
         let stream = Flux.Stream.map fn stream in
-        Msendmail.sendmail ~encoder ~decoder ~queue t.he ~destination
+        Msendmail.sendmail ~encoder ~decoder ~queue t.he ~destination ?port
           ~domain:info.domain ?cfg:info.tls from recipients stream
     | (_mx, ipaddrs) :: mxs, Some (stream, seq) -> begin
         let destination = `Ips ipaddrs in
         let fn str = (str, 0, String.length str) in
         let stream = Flux.Stream.map fn stream in
         let result =
-          Msendmail.sendmail ~encoder ~decoder ~queue t.he ~destination
+          Msendmail.sendmail ~encoder ~decoder ~queue t.he ~destination ?port
             ~domain:info.domain ?cfg:info.tls from recipients stream
         in
         match result with
@@ -234,7 +235,7 @@ let broadcast t ~info resolver txs seq =
   in
   List.map fn results |> List.flatten
 
-let sendmail t ~info resolver ~from recipients seq =
+let sendmail ?port t ~info resolver ~from recipients seq =
   if recipients = [] then
     invalid_arg "Facteur.sendmail: recipients must not be empty";
   let recipients = Aggregate.to_recipients ~domain:info.domain recipients in
@@ -242,7 +243,7 @@ let sendmail t ~info resolver ~from recipients seq =
       m "send email to: %a" Fmt.(list ~sep:(any ",") Aggregate.pp) recipients);
   let fn recipients =
     Miou.async @@ fun () ->
-    let result = sendmail t info resolver (from, recipients) seq in
+    let result = sendmail ?port t info resolver (from, recipients) seq in
     (recipients, result)
   in
   let prms = List.map fn recipients in

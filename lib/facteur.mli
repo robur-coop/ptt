@@ -30,7 +30,8 @@ val pp_error : error Fmt.t
 (** {1 Sending functions} *)
 
 val sendmail :
-     t
+     ?port:int
+  -> t
   -> info:info
   -> Ptt.resolver
   -> from:Colombe.Reverse_path.t
@@ -41,6 +42,7 @@ val sendmail :
     to [recipients]. Recipients are grouped by destination domain and each group
     is delivered concurrently via {!Miou.async}. The mail exchangers for each
     domain are resolved through [resolver] and tried in order of MX preference.
+    [port] overrides the SMTP port used for delivery (default [25]).
 
     [email] is a {!Seq.t} of {!Flux.stream} values: each element of the sequence
     is a replayable copy of the email body, consumed once per MX attempt (to
