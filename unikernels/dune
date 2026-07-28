@@ -61,6 +61,7 @@
   ptt.ca
   ptt.cli
   ptt
+  ptt.milter
   ptt.facteur
   mirage-crypto-rng-mkernel
   gmp

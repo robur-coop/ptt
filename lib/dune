@@ -11,6 +11,12 @@
  (libraries ptt cattery dns colombe.emile emile msendmail))
 
 (library
+ (name milter)
+ (public_name ptt.milter)
+ (modules milter)
+ (libraries ptt flux mnet logs fmt ipaddr))
+
+(library
  (name ptt_cli)
  (public_name ptt.cli)
  (modules ptt_cli)
