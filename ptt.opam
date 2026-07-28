@@ -4,7 +4,7 @@ authors: ["Robur <team@robur.coop>"]
 homepage: "https://github.com/robur-coop/ptt"
 dev-repo: "git+https://github.com/robur-coop/ptt.git"
 bug-reports: "https://github.com/robur-coop/ptt/issues"
-license: "MIT"
+license: "AGPL"
 
 depends: [
   "ocaml" {>= "5.3.0"}
