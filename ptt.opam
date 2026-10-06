@@ -10,6 +10,12 @@ depends: [
   "ocaml" {>= "5.3.0"}
   "dune" {>= "3.0.0"}
   "mirage-crypto-rng-mkernel"
+  "dns-certify"
+  "dns-tsig"
+  "mfat"
+  "mnet"
+  "mnet-dns"
+  "mnet-cli"
   "progress"
   "flux"
   "carton"
