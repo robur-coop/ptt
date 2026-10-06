@@ -4,7 +4,7 @@ authors: ["Robur <team@robur.coop>"]
 homepage: "https://github.com/robur-coop/ptt"
 dev-repo: "git+https://github.com/robur-coop/ptt.git"
 bug-reports: "https://github.com/robur-coop/ptt/issues"
-license: "AGPL"
+license: "AGPL-3.0-or-later"
 
 depends: [
   "ocaml" {>= "5.3.0"}
@@ -37,11 +37,12 @@ build: [
 ]
 synopsis: "Unikernels for SMTP services"
 pin-depends: [
-  [ "zarith.dev"   "git+https://github.com/mirage/Zarith.git#df8969d9bb95cffca13e31a615189ab27ada0684" ]
-  [ "mnet.dev"     "git+https://github.com/robur-coop/mnet.git#2922840708ccd42176a0a187d2d8ed1ef92c67d4" ]
-  [ "mnet-cli.dev" "git+https://github.com/robur-coop/mnet.git#2922840708ccd42176a0a187d2d8ed1ef92c67d4" ]
-  [ "mnet-dns.dev" "git+https://github.com/robur-coop/mnet.git#2922840708ccd42176a0a187d2d8ed1ef92c67d4" ]
-  [ "mnet-tls.dev" "git+https://github.com/robur-coop/mnet.git#2922840708ccd42176a0a187d2d8ed1ef92c67d4" ]
-  [ "unic.dev"     "git+https://github.com/robur-coop/unic.git#02fe3283c384f387e38f4f29c28688db22ad4a28" ]
-  [ "uniq.dev"     "git+https://github.com/robur-coop/unic.git#02fe3283c384f387e38f4f29c28688db22ad4a28" ]
+  [ "zarith.dev"              "git+https://github.com/mirage/Zarith.git#df8969d9bb95cffca13e31a615189ab27ada0684" ]
+  [ "mnet.dev"                "git+https://github.com/robur-coop/mnet.git#2922840708ccd42176a0a187d2d8ed1ef92c67d4" ]
+  [ "mnet-cli.dev"            "git+https://github.com/robur-coop/mnet.git#2922840708ccd42176a0a187d2d8ed1ef92c67d4" ]
+  [ "mnet-dns.dev"            "git+https://github.com/robur-coop/mnet.git#2922840708ccd42176a0a187d2d8ed1ef92c67d4" ]
+  [ "mnet-happy-eyeballs.dev" "git+https://github.com/robur-coop/mnet.git#2922840708ccd42176a0a187d2d8ed1ef92c67d4" ]
+  [ "mnet-tls.dev"            "git+https://github.com/robur-coop/mnet.git#2922840708ccd42176a0a187d2d8ed1ef92c67d4" ]
+  [ "unic.dev"                "git+https://github.com/robur-coop/unic.git#02fe3283c384f387e38f4f29c28688db22ad4a28" ]
+  [ "uniq.dev"                "git+https://github.com/robur-coop/unic.git#02fe3283c384f387e38f4f29c28688db22ad4a28" ]
 ]
