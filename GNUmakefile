@@ -1,7 +1,14 @@
-vendors:
-	test ! -d $@
-	mkdir vendors
-	@./source.sh
+_mfetch:
+	@echo " INFER"
+	unic infer -r . -x _build -x vendors -x bin -x test -x install.ml \
+		--prefer digestif.c --prefer colombe \
+                --prefer mirage-ptime.solo5 --prefer mrmime \
+		--prefer cmdliner \
+		-o _mfetch
+
+vendors: _mfetch
+	@echo " FETCH"
+	mfetch -q
 
 lipap.hvt.target: | vendors
 	@rm -f ./unikernels/lipap.exe
