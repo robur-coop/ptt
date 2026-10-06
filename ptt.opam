@@ -23,6 +23,8 @@ depends: [
   "dkim"
   "re"
   "uuidm"
+  "unic" {build}
+  "mfetch" {build}
   "duration" {>= "0.3.0"}
 ]
 build: [
