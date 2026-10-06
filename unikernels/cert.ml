@@ -28,10 +28,10 @@ let send flow answer =
 let recv flow =
   try
     let len = Bytes.create 2 in
-    Mnet.TCP.really_read flow len;
+    Mnet.TCP.really_input flow len;
     let len = Bytes.get_uint16_be len 0 in
     let buf = Bytes.create len in
-    Mnet.TCP.really_read flow buf;
+    Mnet.TCP.really_input flow buf;
     Ok (Bytes.unsafe_to_string buf)
   with exn ->
     let _, (dst, port) = Mnet.TCP.peers flow in
@@ -99,7 +99,8 @@ let retrieve_certificate tcp (dns_key_name, dns_key) ~hostname
     |> Result.fold ~ok ~error
   in
   let* csr = Dns_certify.signing_request hostname ~more_hostnames key in
-  let flow = Mnet.TCP.connect tcp (dns, port) in
+  let kind = Mnet.TCP.buffer ~limit:None 0x100 in
+  let flow = Mnet.TCP.connect ~kind tcp (dns, port) in
   let finally = Mnet.TCP.close in
   let res = Miou.Ownership.create ~finally flow in
   Miou.Ownership.own res;

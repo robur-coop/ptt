@@ -82,7 +82,7 @@ let read_exactly flow n =
   if n = 0 then ""
   else begin
     let buf = Bytes.create n in
-    Mnet.TCP.really_read flow buf ~off:0 ~len:n;
+    Mnet.TCP.really_input flow buf ~off:0 ~len:n;
     Bytes.unsafe_to_string buf
   end
 
@@ -99,6 +99,7 @@ let write flow cmd data = Mnet.TCP.write flow (Wire.packet cmd data)
 let continue flow = write flow 'c' ""
 
 let handler ?encoder:_ ?decoder:_ ?queue:_ ~info flow (ic, oc) q =
+  let flow = Mnet.TCP.unsafe_to_bufferize ~limit:None 0x100 flow in
   let _, (peer, port) = Mnet.TCP.peers flow in
   Log.debug (fun m -> m "New milter client: %a:%d" Ipaddr.pp peer port);
   let ic_done = ref false in

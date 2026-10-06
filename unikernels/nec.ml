@@ -130,9 +130,9 @@ type value = {
 
 let new_line = "\r\n"
 
-let handler pool ~info:(sinfo, cinfo) client _dns resolver flow t =
+let handler pool ~info:(sinfo, cinfo) client _dns resolver fd t =
   Cattery.use pool @@ fun v ->
-  let _, (peer, port) = Mnet.TCP.peers flow in
+  let _, (peer, port) = Mnet.TCP.peers fd in
   let ic = Miou.Computation.create () in
   let oc = Miou.Computation.create () in
   Logs.debug (fun m -> m "new client: %a:%d" Ipaddr.pp peer port);
@@ -144,7 +144,8 @@ let handler pool ~info:(sinfo, cinfo) client _dns resolver flow t =
     Miou.Ownership.own resource;
     let encoder = Fun.const v.encoder
     and decoder = Fun.const v.decoder
-    and queue = Fun.const v.queue in
+    and queue = Fun.const v.queue
+    and flow = Msendmail.flow_of_fd fd in
     match
       Ptt.Relay.handler ~encoder ~decoder ~queue ~info:sinfo resolver flow
         (ic, oc) q
@@ -270,7 +271,7 @@ let handler pool ~info:(sinfo, cinfo) client _dns resolver flow t =
   in
   let _ = Miou.await prm0 in
   let () = Miou.await_exn prm1 in
-  Mnet.TCP.close flow
+  Mnet.TCP.close fd
 
 (* NOTE(dinosaure): the milter variant of [handler]. The protocol underneath
    changes (SMTP relay -> milter), but the signing pipeline is identical: we
@@ -564,15 +565,17 @@ module RNG = Mirage_crypto_rng.Fortuna
 let rng () = Mirage_crypto_rng_mkernel.initialize (module RNG)
 let rng = Mkernel.map rng Mkernel.[]
 
-let run _ (cidrv4, gateway, ipv6) info nameservers destination cfg primary
-    (verify, update) milter =
-  Mkernel.(run [ rng; Mnet.stack ~name:"service" ?gateway ~ipv6 cidrv4 ])
+let run _ (cidrv4, gateway, ipv6, ipv6_gateway) info nameservers destination cfg
+    primary (verify, update) milter =
+  Mkernel.(
+    run [ rng; Mnet.stack ~name:"service" ?gateway ~ipv6 ?ipv6_gateway cidrv4 ])
   @@ fun rng (stack, tcp, udp) () ->
   let@ () = fun () -> Mirage_crypto_rng_mkernel.kill rng in
   let@ () = fun () -> Mnet.kill stack in
   let hed, he = Mnet_happy_eyeballs.create tcp in
   let@ () = fun () -> Mnet_happy_eyeballs.kill hed in
-  let dns = Mnet_dns.create ~nameservers (udp, he) in
+  let stack = Mnet_dns.Transport.stack udp he in
+  let dns = Mnet_dns.create ~nameservers stack in
   let t = Mnet_dns.transport dns in
   let@ () = fun () -> Mnet_dns.Transport.kill t in
   let pool =
@@ -610,8 +613,8 @@ let run _ (cidrv4, gateway, ipv6) info nameservers destination cfg primary
   let rec go orphans listen fn =
     clean_up orphans;
     Logs.debug (fun m -> m "Waiting for a new connection");
-    let flow = Mnet.TCP.accept tcp listen in
-    let _ = Miou.async ~orphans @@ fun () -> fn flow in
+    let fd = Mnet.TCP.accept ~kind:Mnet.TCP.Direct tcp listen in
+    let _ = Miou.async ~orphans @@ fun () -> fn fd in
     go orphans listen fn
   in
   match milter with
@@ -710,7 +713,7 @@ let setup_logs utf_8 style_renderer sources level =
 let setup_logs =
   Term.(const setup_logs $ utf_8 $ renderer $ setup_sources $ verbosity)
 
-let setup_nameservers = Mnet_cli.setup_nameservers ()
+let setup_nameservers = Mnet_dns_cli.setup ()
 let docs_signer = "Signature configuration"
 
 let fields =

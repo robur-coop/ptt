@@ -59,7 +59,7 @@ module Relay : sig
     -> ?queue:(unit -> (char, Bigarray.int8_unsigned_elt) Ke.Rke.t)
     -> info:info
     -> resolver
-    -> Mnet.TCP.flow
+    -> Msendmail.flow
     -> ic * oc
     -> (string, 'r) Flux.Bqueue.t
     -> (unit, error) result

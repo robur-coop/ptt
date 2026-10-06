@@ -1,7 +1,7 @@
 module Blk = struct
   type t = Mkernel.Block.t
 
-  let pagesize = Mkernel.Block.pagesize
+  let pagesize = Mkernel.Block.sector_size
   let read = Mkernel.Block.atomic_read
   let write = Mkernel.Block.atomic_write
 end
@@ -352,13 +352,13 @@ let to_forward ~cfg flow =
   let _, (peer, _) = Mnet.TCP.peers flow in
   cfg.forward peer
 
-let handler ~cfg ~info:((sinfo, _) as info) flow =
+let handler ~cfg ~info:((sinfo, _) as info) fd =
   Cattery.use cfg.pool @@ fun v ->
-  let forward = to_forward ~cfg flow in
+  let forward = to_forward ~cfg fd in
   (* NOTE(dinosaure): here, we use [to_arc] but we can also use [to_dkim]
      but it does not really matter. *)
-  let resolver = resolver_according_to_peer ~cfg cfg.to_arc flow in
-  let _, (peer, port) = Mnet.TCP.peers flow in
+  let resolver = resolver_according_to_peer ~cfg cfg.to_arc fd in
+  let _, (peer, port) = Mnet.TCP.peers fd in
   let ic = Miou.Computation.create () in
   let oc = Miou.Computation.create () in
   let q = Flux.Bqueue.(create with_close) 0x7ff in
@@ -369,7 +369,8 @@ let handler ~cfg ~info:((sinfo, _) as info) flow =
     Miou.Ownership.own resource;
     let encoder = Fun.const v.encoder
     and decoder = Fun.const v.decoder
-    and queue = Fun.const v.queue in
+    and queue = Fun.const v.queue
+    and flow = Msendmail.flow_of_fd fd in
     match
       Ptt.Relay.handler ~encoder ~decoder ~queue ~info:sinfo resolver flow
         (ic, oc) q
@@ -397,7 +398,7 @@ let handler ~cfg ~info:((sinfo, _) as info) flow =
   in
   let _ = Miou.await prm0 in
   let () = Miou.await_exn prm1 in
-  Mnet.TCP.close flow
+  Mnet.TCP.close fd
 
 let rec clean_up orphans =
   match Miou.care orphans with
@@ -429,11 +430,12 @@ let server ~cfg ~info tcp dns_key ~hostname ~key_seed (dns_ip, dns_port) =
   let mutex = Miou.Mutex.create () in
   let condition = Miou.Condition.create () in
   let shared = Queue.create () in
+  let kind = Mnet.TCP.Direct in
   let rec filler () =
-    let flow = Mnet.TCP.accept tcp listen in
+    let fd = Mnet.TCP.accept ~kind tcp listen in
     let () =
       Miou.Mutex.protect mutex @@ fun () ->
-      Queue.push flow shared;
+      Queue.push fd shared;
       Miou.Condition.signal condition
     in
     filler ()
@@ -471,8 +473,8 @@ let server ~cfg ~info tcp dns_key ~hostname ~key_seed (dns_ip, dns_port) =
             done;
             if expired certs then `Expired
             else begin
-              let flows = List.of_seq (Queue.to_seq shared) in
-              Queue.clear shared; `Clients flows
+              let fds = List.of_seq (Queue.to_seq shared) in
+              Queue.clear shared; `Clients fds
             end
           in
           match state with
@@ -480,14 +482,14 @@ let server ~cfg ~info tcp dns_key ~hostname ~key_seed (dns_ip, dns_port) =
               Logs.info (fun m -> m "Certificate expiring, renewing...");
               Miou.await_exn signal;
               Miou.cancel server
-          | `Clients flows ->
-              let fn flow =
-                let _, (peer, port) = Mnet.TCP.peers flow in
+          | `Clients fds ->
+              let fn fd =
+                let _, (peer, port) = Mnet.TCP.peers fd in
                 Logs.debug (fun m ->
                     m "Got a new connection from %a:%d" Ipaddr.pp peer port);
-                ignore (Miou.async ~orphans @@ fun () -> handler flow)
+                ignore (Miou.async ~orphans @@ fun () -> handler fd)
               in
-              List.iter fn flows; until_expiration orphans
+              List.iter fn fds; until_expiration orphans
         in
         until_expiration orphans; go orphans
   in
@@ -572,19 +574,23 @@ let temp ~info client resolver fs bounces =
     Jsont_bytesrw.decode_string json contents |> Result.map_error msg
   else Ok (Temp.create ~info ~store client resolver fs action bounces)
 
-let run _ (cidrv4, gateway, ipv6) info nameservers forward_granted_for to_arc
-    to_dkim cert admin =
+let run _ (cidrv4, gateway, ipv6, ipv6_gateway) info nameservers
+    forward_granted_for to_arc to_dkim cert admin =
   let hostname, cert_dns, dns_key, key_seed = cert in
   let devices =
     let open Mkernel in
-    [ rng; Mnet.stack ~name:"service" ?gateway ~ipv6 cidrv4; fat ~name:"lipap" ]
+    [
+      rng; Mnet.stack ~name:"service" ?gateway ~ipv6 ?ipv6_gateway cidrv4
+    ; fat ~name:"lipap"
+    ]
   in
   Mkernel.run devices @@ fun rng (stack, tcp, udp) fs () ->
   let@ () = fun () -> Mirage_crypto_rng_mkernel.kill rng in
   let@ () = fun () -> Mnet.kill stack in
   let hed, he = Mnet_happy_eyeballs.create tcp in
   let@ () = fun () -> Mnet_happy_eyeballs.kill hed in
-  let dns = Mnet_dns.create ~nameservers (udp, he) in
+  let stack = Mnet_dns.Transport.stack udp he in
+  let dns = Mnet_dns.create ~nameservers stack in
   let t = Mnet_dns.transport dns in
   let@ () = fun () -> Mnet_dns.Transport.kill t in
   let sinfo = fst info in
@@ -731,8 +737,6 @@ let setup_logs utf_8 style_renderer sources level =
 let setup_logs =
   Term.(const setup_logs $ utf_8 $ renderer $ setup_sources $ verbosity)
 
-let setup_nameservers = Mnet_cli.setup_nameservers ()
-
 let destination =
   let doc =
     "The SMTP destination for outgoing mailing list emails (typically a signer \
@@ -866,7 +870,7 @@ let term =
   $ setup_logs
   $ Mnet_cli.setup
   $ Ptt_cli.term_info
-  $ setup_nameservers
+  $ Mnet_dns_cli.setup ()
   $ forward_granted_for
   $ destination
   $ submission_destination

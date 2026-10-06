@@ -1,11 +1,16 @@
 let msgf fmt = Fmt.kstr (fun msg -> `Msg msg) fmt
 
 let prefix =
-  X509.Distinguished_name.[ Relative_distinguished_name.singleton (CN "ptt") ]
+  X509.Distinguished_name.
+    [ Relative_distinguished_name.singleton (CN (Common_name.v "ptt")) ]
 
 let cacert_dn =
   let open X509.Distinguished_name in
-  prefix @ [ Relative_distinguished_name.singleton (CN "Ephemeral CA for ptt") ]
+  prefix
+  @ [
+      Relative_distinguished_name.singleton
+        (CN (Common_name.v "Ephemeral CA for ptt"))
+    ]
 
 let cacert_lifetime = Ptime.Span.v (365, 0L)
 let _10s = Ptime.Span.of_int_s 10

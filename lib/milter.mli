@@ -33,7 +33,7 @@ val handler :
   -> ?decoder:(unit -> bytes)
   -> ?queue:(unit -> (char, Bigarray.int8_unsigned_elt) Ke.Rke.t)
   -> info:info
-  -> Mnet.TCP.flow
+  -> Mnet.TCP.direct Mnet.TCP.flow
   -> ic * oc
   -> (string, 'r) Flux.Bqueue.t
   -> (unit, error) result

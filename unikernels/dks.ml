@@ -60,7 +60,9 @@ let domain_keys tcp dns_server (dns_key_name, dns_key) domain_name =
       dns_key_name
     |> Result.map_error @@ function #Dns_tsig.s as err -> err
   in
-  let flow = Mnet.TCP.connect tcp dns_server in
+  let kind = Mnet.TCP.buffer ~limit:None 0x80 in
+  (* TODO(dinosaure): use [direct] or set a limit. *)
+  let flow = Mnet.TCP.connect ~kind tcp dns_server in
   let@ () = fun () -> Mnet.TCP.close flow in
   let len = Bytes.create 2 in
   Bytes.set_uint16_be len 0 (String.length data);
@@ -68,10 +70,10 @@ let domain_keys tcp dns_server (dns_key_name, dns_key) domain_name =
   Mnet.TCP.write flow len;
   Mnet.TCP.write flow data;
   let len = Bytes.create 2 in
-  Mnet.TCP.really_read flow ~len:2 len;
+  Mnet.TCP.really_input flow ~len:2 len;
   let len = Bytes.get_uint16_be len 0 in
   let buf = Bytes.create len in
-  Mnet.TCP.really_read flow ~len buf;
+  Mnet.TCP.really_input flow ~len buf;
   let str = Bytes.unsafe_to_string buf in
   let* pkt', _, _ =
     Dns_tsig.decode_and_verify (Mirage_ptime.now ()) dns_key dns_key_name ~mac
@@ -123,7 +125,8 @@ let update tcp dns_server (dns_key_name, dns_key) dkim ~with_version dk =
         else Ok zone
   in
   let* selector = Dkim.domain_name dkim in
-  let flow = Mnet.TCP.connect tcp dns_server in
+  let kind = Mnet.TCP.buffer ~limit:None 0x80 in
+  let flow = Mnet.TCP.connect ~kind tcp dns_server in
   let@ () = fun () -> Mnet.TCP.close flow in
   let txts =
     Dns.Rr_map.Txt_set.singleton (Dkim.domain_key_to_string ~with_version dk)
@@ -149,10 +152,10 @@ let update tcp dns_server (dns_key_name, dns_key) dkim ~with_version dk =
   Mnet.TCP.write flow len;
   Mnet.TCP.write flow data;
   let len = Bytes.create 2 in
-  Mnet.TCP.really_read flow ~len:2 len;
+  Mnet.TCP.really_input flow ~len:2 len;
   let len = Bytes.get_uint16_be len 0 in
   let buf = Bytes.create len in
-  Mnet.TCP.really_read flow ~len buf;
+  Mnet.TCP.really_input flow ~len buf;
   let str = Bytes.unsafe_to_string buf in
   let* pkt', _, _ =
     Dns_tsig.decode_and_verify (Mirage_ptime.now ()) dns_key dns_key_name ~mac
