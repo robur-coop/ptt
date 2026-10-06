@@ -38,6 +38,9 @@ build: [
 synopsis: "Unikernels for SMTP services"
 pin-depends: [
   [ "zarith.dev"              "git+https://github.com/mirage/Zarith.git#df8969d9bb95cffca13e31a615189ab27ada0684" ]
+  [ "msendmail.dev"           "git+https://github.com/mirage/colombe.git#de2847fbb156fb4686ef9fde69e23090a8b8854e" ]
+  [ "colombe.dev"             "git+https://github.com/mirage/colombe.git#de2847fbb156fb4686ef9fde69e23090a8b8854e" ]
+  [ "sendmail.dev"            "git+https://github.com/mirage/colombe.git#de2847fbb156fb4686ef9fde69e23090a8b8854e" ]
   [ "mnet.dev"                "git+https://github.com/robur-coop/mnet.git#2922840708ccd42176a0a187d2d8ed1ef92c67d4" ]
   [ "mnet-cli.dev"            "git+https://github.com/robur-coop/mnet.git#2922840708ccd42176a0a187d2d8ed1ef92c67d4" ]
   [ "mnet-dns.dev"            "git+https://github.com/robur-coop/mnet.git#2922840708ccd42176a0a187d2d8ed1ef92c67d4" ]
