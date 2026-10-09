@@ -492,7 +492,7 @@ let expiration = function
   | DKIM t -> Dkim.expire t.dkim
   | ARC t -> Arc.Sign.expire t.seal
 
-let count = function DKIM t -> t.count | ARC _ -> assert false
+let count = function DKIM t -> t.count | ARC t -> t.count
 let domain_name = function DKIM t -> t.domain_name | ARC t -> t.domain_name
 let pk = function DKIM t -> t.pk | ARC t -> t.pk
 
