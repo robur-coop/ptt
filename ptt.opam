@@ -38,14 +38,6 @@ build: [
 synopsis: "Unikernels for SMTP services"
 pin-depends: [
   [ "zarith.dev"              "git+https://github.com/mirage/Zarith.git#df8969d9bb95cffca13e31a615189ab27ada0684" ]
-  [ "msendmail.dev"           "git+https://github.com/mirage/colombe.git#de2847fbb156fb4686ef9fde69e23090a8b8854e" ]
-  [ "colombe.dev"             "git+https://github.com/mirage/colombe.git#de2847fbb156fb4686ef9fde69e23090a8b8854e" ]
-  [ "sendmail.dev"            "git+https://github.com/mirage/colombe.git#de2847fbb156fb4686ef9fde69e23090a8b8854e" ]
-  [ "mnet.dev"                "git+https://github.com/robur-coop/mnet.git#c85e0ab53ec8b48b74e7cd977e4701cb9380a8dc" ]
-  [ "mnet-cli.dev"            "git+https://github.com/robur-coop/mnet.git#c85e0ab53ec8b48b74e7cd977e4701cb9380a8dc" ]
-  [ "mnet-dns.dev"            "git+https://github.com/robur-coop/mnet.git#c85e0ab53ec8b48b74e7cd977e4701cb9380a8dc" ]
-  [ "mnet-happy-eyeballs.dev" "git+https://github.com/robur-coop/mnet.git#c85e0ab53ec8b48b74e7cd977e4701cb9380a8dc" ]
-  [ "mnet-tls.dev"            "git+https://github.com/robur-coop/mnet.git#c85e0ab53ec8b48b74e7cd977e4701cb9380a8dc" ]
-  [ "unic.dev"                "git+https://github.com/robur-coop/unic.git#02fe3283c384f387e38f4f29c28688db22ad4a28" ]
-  [ "uniq.dev"                "git+https://github.com/robur-coop/unic.git#02fe3283c384f387e38f4f29c28688db22ad4a28" ]
+  [ "dmarc.dev"               "git+https://github.com/dinosaure/ocaml-dmarc.git#d5832f064b820a0ef0be1e4fc63808c6cd3ef6fa" ]
+  [ "arc.dev"                 "git+https://git.robur.coop/robur/ocaml-arc.git#0fede0167548a76ebfb5f2fc0f93c11f3282165a" ]
 ]
