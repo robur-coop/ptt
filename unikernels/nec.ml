@@ -442,7 +442,7 @@ let get_domain_key_and_key info tcp primary (cfg : cfg) :
       | None ->
           let* selector = selectorf self in
           let x = expiration_with_selectorf cfg.expiration in
-          let count = Int.max 1 count in
+          let count = succ count in
           let* v = DKIM.v ~count ~cfg ?x ~selector pk domain_name in
           Ok (DKIM v)
       end
@@ -471,7 +471,7 @@ let get_domain_key_and_key info tcp primary (cfg : cfg) :
       | None ->
           let* selector = selectorf self in
           let x = expiration_with_selectorf cfg.expiration in
-          let count = Int.max 1 count in
+          let count = succ count in
           let* v = ARC.v ~count ~cfg ~msgsig ?x ~selector pk domain_name in
           Ok (ARC v)
       end
