@@ -16,7 +16,7 @@ type field = Mrmime.Field_name.t * Unstrctrd.t
 
 val headers : (string, (field list, [> error ]) result) Flux.sink
 
-type dmarc = Dmarc.Verify.info * Dmarc.DKIM.t list * [ `Fail | `Pass ]
+type dmarc = Dmarc.Verify.info
 
 val dmarc :
   ctx:Uspf.ctx -> Mnet_dns.t -> (string, (dmarc, [> error ]) result) Flux.sink
@@ -36,3 +36,8 @@ val arc :
 val save_into : Bstr.t -> (string, Bstr.t) Flux.sink
 val from_bstr : ?len:int -> Bstr.t -> string Flux.source
 val chain_from_headers : field list -> Arc.Sign.user's_chain
+val aresults : receiver:Emile.domain -> Prettym.ppf -> dmarc -> Prettym.ppf
+val last_arc_set : field list -> int
+val receiver : info:Ptt.info -> Emile.domain
+val static : Ipaddr.t -> Ptt.resolver
+val resolver_from_dns : Mnet_dns.t -> Ptt.resolver

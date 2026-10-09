@@ -39,8 +39,8 @@ let verify dns dkim dk =
       let expired = Option.map Int64.to_float (Dkim.expire dkim) in
       let expired = Option.map Ptime.of_float_s expired in
       let expired = Option.join expired in
-      let than = Mirage_ptime.now () in
-      let expired = Option.map (Ptime.is_later ~than) expired in
+      let now = Mirage_ptime.now () in
+      let expired = Option.map (Ptime.is_earlier ~than:now) expired in
       let expired = Option.value ~default:false expired in
       Log.debug (fun m -> m "%a expired? %b" Domain_name.pp domain_name expired);
       Ok (Dkim.equal_domain_key dk dk' && not expired)

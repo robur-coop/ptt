@@ -75,53 +75,6 @@ let is_admin fp info cfg =
   | _ -> None
 
 module Incoming = struct
-  let aresults ~receiver ppf =
-    let open Prettym in
-    eval ppf
-      [
-        string $ "Authentication-Results"; char $ ':'; spaces 1
-      ; !!(Dmarc.Encoder.field ~receiver)
-      ]
-
-  let last_arc_set hdrs =
-    let is_arc_seal =
-      let open Mrmime.Field_name in
-      equal (v "ARC-Seal")
-    in
-    let get_arc_signature unstrctrd =
-      let* m = Dkim.of_unstrctrd_to_map unstrctrd in
-      let none = msgf "Missing i ARC field" in
-      let* i = Option.to_result ~none (Dkim.get_key "i" m) in
-      let none = msgf "Invalid unique ARC ID value" in
-      let* i = Option.to_result ~none (int_of_string_opt i) in
-      let* t = Dkim.map_to_t m in
-      Ok (i, t, m)
-    in
-    let rec go uid = function
-      | (field_name, unstrctrd) :: hdrs ->
-          if is_arc_seal field_name then
-            match get_arc_signature unstrctrd with
-            | Ok (uid', _, _) -> go (Int.max uid uid') hdrs
-            | Error _ -> go uid hdrs
-          else go uid hdrs
-      | [] -> uid
-    in
-    go 0 hdrs
-
-  let receiver ~info =
-    match info.Ptt.domain with
-    | Colombe.Domain.Domain ds -> `Domain ds
-    | IPv4 ipv4 -> `Addr (Emile.IPv4 ipv4)
-    | IPv6 ipv6 -> `Addr (Emile.IPv6 ipv6)
-    | Extension (k, v) -> `Addr (Emile.Ext (k, v))
-
-  let static destination =
-    let gethostbyname ipaddrs _ = Result.ok ipaddrs
-    and getmxbyname _ mail_exchange =
-      Ok (Dns.Rr_map.Mx_set.singleton { preference= 0; mail_exchange })
-    in
-    Ptt.Resolver { gethostbyname; getmxbyname; dns= [ destination ] }
-
   let send_locally client ~info ?aresults lst ipaddr outgoing =
     let resolver = static ipaddr in
     let fn lst { Mlm.sender; recipients; seq } =
@@ -320,22 +273,6 @@ module Outgoing = struct
     in
     List.iter fn errs
 end
-
-let resolver_from_dns dns =
-  let gethostbyname dns domain_name =
-    let ipv4 = Mnet_dns.gethostbyname dns domain_name in
-    let ipv6 = Mnet_dns.gethostbyname6 dns domain_name in
-    match (ipv4, ipv6) with
-    | Ok ipv4, Ok ipv6 -> Ok [ Ipaddr.V4 ipv4; Ipaddr.V6 ipv6 ]
-    | Ok ipv4, Error _ -> Ok [ Ipaddr.V4 ipv4 ]
-    | Error _, Ok ipv6 -> Ok [ Ipaddr.V6 ipv6 ]
-    | (Error _ as err), _ -> err
-  in
-  let getmxbyname dns domain_name =
-    let* _ttl, mxs = Mnet_dns.getaddrinfo dns Dns.Rr_map.Mx domain_name in
-    Ok mxs
-  in
-  Ptt.Resolver { gethostbyname; getmxbyname; dns }
 
 let resolver_according_to_peer ~cfg static flow =
   let _, (peer, _) = Mnet.TCP.peers flow in

@@ -555,7 +555,19 @@ let renew tcp dns primary (cfg : cfg) t =
   match (cfg, primary) with
   | DKIM { selector= `Fmt self; expiration= Some (`For x); _ }, Some _
   | ARC ({ selector= `Fmt self; expiration= Some (`For x); _ }, _), Some _ ->
-      let fn () = renew tcp dns primary ~expiration:x ~self t in
+      let fn () =
+        match renew tcp dns primary ~expiration:x ~self t with
+        | Ok () -> ()
+        | Error err ->
+            Logs.err (fun m ->
+                m "Impossible to renew our key: %a" Dks.pp_error err)
+        | exception (Miou.Cancelled as exn) -> raise exn
+        | exception exn ->
+            Logs.err (fun m ->
+                m "Unexpected exception while renewing our key: %s"
+                  (Printexc.to_string exn));
+            raise exn
+      in
       let prm = Miou.async fn in
       Some prm
   | _ -> None
