@@ -20,7 +20,7 @@
  (name utils)
  (public_name ptt.utils)
  (modules utils)
- (libraries flux arc dmarc mnet-dns))
+ (libraries ptt flux arc dmarc mnet-dns))
 
 ; (executable
 ;  (name elit)
