@@ -28,6 +28,12 @@ depends: [
   "dkim"
   "re"
   "uuidm"
+  "kdf"
+  "ohex"
+  "eqaf"
+  "jsont"
+  "tally"
+  "tally-mnet"
   "unic" {build}
   "mfetch" {build}
   "duration" {>= "0.3.0"}
@@ -40,4 +46,6 @@ pin-depends: [
   [ "zarith.dev"              "git+https://github.com/mirage/Zarith.git#df8969d9bb95cffca13e31a615189ab27ada0684" ]
   [ "dmarc.dev"               "git+https://github.com/dinosaure/ocaml-dmarc.git#d5832f064b820a0ef0be1e4fc63808c6cd3ef6fa" ]
   [ "arc.dev"                 "git+https://git.robur.coop/robur/ocaml-arc.git#0fede0167548a76ebfb5f2fc0f93c11f3282165a" ]
+  [ "unic.dev"                "git+https://git.robur.coop/robur/unic.git#02fe3283c384f387e38f4f29c28688db22ad4a28" ]
+  [ "uniq.dev"                "git+https://git.robur.coop/robur/unic.git#02fe3283c384f387e38f4f29c28688db22ad4a28" ]
 ]
