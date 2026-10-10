@@ -511,15 +511,11 @@ let temp ~info client resolver fs bounces =
     Jsont_bytesrw.decode_string json contents |> Result.map_error msg
   else Ok (Temp.create ~info ~store client resolver fs action bounces)
 
-let run _ (cidrv4, gateway, ipv6, ipv6_gateway) info nameservers
-    forward_granted_for to_arc to_dkim cert admin =
+let run _ stack info nameservers forward_granted_for to_arc to_dkim cert admin =
   let hostname, cert_dns, dns_key, key_seed = cert in
   let devices =
     let open Mkernel in
-    [
-      rng; Mnet.stack ~name:"service" ?gateway ~ipv6 ?ipv6_gateway cidrv4
-    ; fat ~name:"lipap"
-    ]
+    [ rng; stack; fat ~name:"lipap" ]
   in
   Mkernel.run devices @@ fun rng (stack, tcp, udp) fs () ->
   let@ () = fun () -> Mirage_crypto_rng_mkernel.kill rng in
@@ -805,7 +801,7 @@ let term =
   let open Term in
   const run
   $ setup_logs
-  $ Mnet_cli.setup
+  $ Mnet_cli.setup "service"
   $ Ptt_cli.term_info
   $ Mnet_dns_cli.setup ()
   $ forward_granted_for

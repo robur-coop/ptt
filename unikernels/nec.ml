@@ -577,11 +577,9 @@ module RNG = Mirage_crypto_rng.Fortuna
 let rng () = Mirage_crypto_rng_mkernel.initialize (module RNG)
 let rng = Mkernel.map rng Mkernel.[]
 
-let run _ (cidrv4, gateway, ipv6, ipv6_gateway) info nameservers destination cfg
-    primary (verify, update) milter =
-  Mkernel.(
-    run [ rng; Mnet.stack ~name:"service" ?gateway ~ipv6 ?ipv6_gateway cidrv4 ])
-  @@ fun rng (stack, tcp, udp) () ->
+let run _ stack info nameservers destination cfg primary (verify, update) milter
+    =
+  Mkernel.(run [ rng; stack ]) @@ fun rng (stack, tcp, udp) () ->
   let@ () = fun () -> Mirage_crypto_rng_mkernel.kill rng in
   let@ () = fun () -> Mnet.kill stack in
   let hed, he = Mnet_happy_eyeballs.create tcp in
@@ -1054,7 +1052,7 @@ let term =
   let open Term in
   const run
   $ setup_logs
-  $ Mnet_cli.setup
+  $ Mnet_cli.setup "service"
   $ Ptt_cli.term_info
   $ setup_nameservers
   $ destination
