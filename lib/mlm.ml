@@ -540,9 +540,10 @@ let incoming t bounces ~from ~rcpt:({ Colombe.Path.local; _ } as rcpt) bstr =
         in
         let subscribers = List.filter (Fun.negate fn) t.subscribers in
         let t = { t with subscribers } in
-        t.store t
-      end;
-      Ok (t, [], [])
+        t.store t;
+        Ok (t, [], [])
+      end
+      else Ok (t, [], [])
   | "subscribe" :: "accept" :: rem ->
       let verp = String.concat "-" rem in
       let* new_subscriber = decode_verp verp in
