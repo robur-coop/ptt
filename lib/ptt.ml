@@ -222,10 +222,11 @@ module Relay = struct
             let t = SMTP.(Monad.recv ctx Value.Payload) in
             let result = run Msendmail.tcp flow t in
             match result with
-            | Ok ".." ->
-                Flux.Bqueue.put q ".\r\n";
-                go (size + 3)
             | Ok "." -> Flux.Bqueue.close q; Ok ()
+            | Ok line when String.length line > 1 && line.[0] = '.' ->
+                let len = String.length line in
+                Flux.Bqueue.put q (String.sub line 1 (len - 1) ^ "\r\n");
+                go (size + len + 1)
             | Error err ->
                 Log.err (fun m -> m "Unexpected error: %a" pp_error err);
                 Flux.Bqueue.close q;
@@ -390,10 +391,11 @@ module Submission = struct
                 let t = SSMTP.(Monad.recv ctx Value.Payload) in
                 let result = run Msendmail.tls flow t in
                 match result with
-                | Ok ".." ->
-                    Flux.Bqueue.put q ".\r\n";
-                    go (size + 3)
                 | Ok "." -> Flux.Bqueue.close q; Ok ()
+                | Ok line when String.length line > 1 && line.[0] = '.' ->
+                    let len = String.length line in
+                    Flux.Bqueue.put q (String.sub line 1 (len - 1) ^ "\r\n");
+                    go (size + len + 1)
                 | Error _ as err -> Flux.Bqueue.close q; err
                 | Ok line ->
                     Flux.Bqueue.put q (line ^ "\r\n");

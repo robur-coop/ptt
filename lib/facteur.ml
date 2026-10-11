@@ -37,6 +37,33 @@ let mxs (Ptt.Resolver { dns; getmxbyname; gethostbyname }) = function
         error_msgf "No SMTP server affiliated to %a" Domain_name.pp domain_name
       else Ok mxs
 
+let lines : (string, string) Flux.flow =
+  let flow (Flux.Sink k) =
+    let init () = (k.init (), "") in
+    let push (s, rest) str =
+      let str = if rest = "" then str else rest ^ str in
+      let rec go s off =
+        match String.index_from_opt str off '\n' with
+        | Some idx when not (k.full s) ->
+            let s = k.push s (String.sub str off (idx - off + 1)) in
+            go s (idx + 1)
+        | _ -> (s, String.sub str off (String.length str - off))
+      in
+      go s 0
+    in
+    let full (s, _) = k.full s in
+    let stop (s, rest) =
+      let s = if rest <> "" && not (k.full s) then k.push s rest else s in
+      k.stop s
+    in
+    Flux.Sink { init; push; full; stop }
+  in
+  { Flux.flow }
+
+let chunks stream =
+  let fn str = (str, 0, String.length str) in
+  Flux.Stream.map fn (Flux.Stream.via lines stream)
+
 let sendmail t info resolver (from, ({ Aggregate.domain; locals } as a)) seq =
   Cattery.use t.pool @@ fun (decoder, encoder, queue) ->
   let encoder = Fun.const encoder
@@ -70,14 +97,12 @@ let sendmail t info resolver (from, ({ Aggregate.domain; locals } as a)) seq =
           "Facteur.sendmail: the given sequence must be a Seq.forever sequence"
     | [ (_mx, ipaddrs) ], Some (stream, _) ->
         let destination = `Ips ipaddrs in
-        let fn str = (str, 0, String.length str) in
-        let stream = Flux.Stream.map fn stream in
+        let stream = chunks stream in
         Msendmail.sendmail ~encoder ~decoder ~queue t.he ~destination
           ~domain:info.domain ?cfg:info.tls from recipients stream
     | (_mx, ipaddrs) :: mxs, Some (stream, seq) -> begin
         let destination = `Ips ipaddrs in
-        let fn str = (str, 0, String.length str) in
-        let stream = Flux.Stream.map fn stream in
+        let stream = chunks stream in
         let result =
           Msendmail.sendmail ~encoder ~decoder ~queue t.he ~destination
             ~domain:info.domain ?cfg:info.tls from recipients stream
@@ -140,11 +165,7 @@ let many t ~info resolver ~destination:domain txs seq =
       m "Try to send %d email(s) to %d Mail-eXchange server(s)"
         (List.length txs) (Mxs.cardinal mxs));
   let mxs = Mxs.bindings mxs in
-  let fn stream =
-    let fn str = (str, 0, String.length str) in
-    Flux.Stream.map fn stream
-  in
-  let seq = Seq.map fn seq in
+  let seq = Seq.map chunks seq in
   let rec go mxs =
     match mxs with
     | [] -> assert false
