@@ -139,8 +139,16 @@ let recipients_are_reachable ~info
     |> Domain_name.Host_set.elements
   in
   let mail_exchange_are_reachable { Dns.Mx.mail_exchange; _ } =
-    let result = gethostbyname dns mail_exchange in
-    Result.is_ok result
+    match gethostbyname dns mail_exchange with
+    | Ok _ -> true
+    | Error (`Msg msg) ->
+        Log.warn (fun m ->
+            m "Impossible to resolve %a: %s" Domain_name.pp mail_exchange msg);
+        false
+    | Error _ ->
+        Log.warn (fun m ->
+            m "Impossible to resolve %a" Domain_name.pp mail_exchange);
+        false
   in
   let domain_are_reachable domain =
     let result = getmxbyname dns domain in
@@ -148,8 +156,21 @@ let recipients_are_reachable ~info
     | Ok mxs ->
         let lst = Dns.Rr_map.Mx_set.elements mxs in
         let lst = List.sort Dns.Mx.compare lst in
-        List.exists mail_exchange_are_reachable lst
-    | Error _ -> false
+        let reachable = List.exists mail_exchange_are_reachable lst in
+        if not reachable then
+          Log.warn (fun m ->
+              m "No reachable mail exchange server for %a" Domain_name.pp domain);
+        reachable
+    | Error (`Msg msg) ->
+        Log.warn (fun m ->
+            m "Impossible to get the mail exchange servers of %a: %s"
+              Domain_name.pp domain msg);
+        false
+    | Error _ ->
+        Log.warn (fun m ->
+            m "Impossible to get the mail exchange servers of %a" Domain_name.pp
+              domain);
+        false
   in
   List.for_all domain_are_reachable domains
 
